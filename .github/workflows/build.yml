@@ -16,22 +16,17 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu flex bison
+          sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu flex bison libelf-dev
 
-      - name: Download Clang 12.0.5
+      - name: Download Clang Toolchain
         run: |
-          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz -O clang.tar.gz
-          mkdir clang
-          tar -xzf clang.tar.gz -C clang
-          rm clang.tar.gz
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+          export PATH="$(pwd)/clang/bin:$PATH"
+          clang --version
 
-      - name: Clone Kernel (exact commit)
+      - name: Clone Kernel
         run: |
           git clone --depth=1 https://android.googlesource.com/kernel/common -b android12-5.10 kernel
-          cd kernel
-          git fetch --depth=500
-          git checkout gc9f59ef34367 || echo "Commit not found, using latest android12-5.10"
-          cd ..
 
       - name: Create Module Source
         run: |
@@ -44,17 +39,13 @@ jobs:
           #include <linux/uaccess.h>
           #include <linux/kallsyms.h>
           #include <linux/kprobes.h>
-          #include <linux/net.h>
-          #include <linux/inet.h>
-          #include <linux/skbuff.h>
-          #include <net/ip.h>
-          #include <net/udp.h>
           #include <asm/pgtable.h>
           #include <linux/pagewalk.h>
 
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("x");
           MODULE_DESCRIPTION("Universal r/w");
+          MODULE_VERSION("1.0");
 
           static unsigned long resolve_ksym(const char *name) {
               struct kprobe kp = { .symbol_name = name };
@@ -70,7 +61,6 @@ jobs:
               return addr;
           }
 
-          static unsigned long (*_kallsyms_lookup_name)(const char *) = NULL;
           static struct mm_struct *init_mm_ptr = NULL;
 
           typedef struct { phys_addr_t phys; bool valid; } v2p_t;
@@ -109,19 +99,21 @@ jobs:
 
           static void hide_module(void) {
               list_del_init(&THIS_MODULE->list);
+              kobject_del(&THIS_MODULE->mkobj.kobj);
           }
 
           static int __init rw_init(void) {
               pr_info("Loading module for 5.10.136");
-              _kallsyms_lookup_name = (void *)resolve_ksym("kallsyms_lookup_name");
+              
               init_mm_ptr = (void *)resolve_ksym("init_mm");
               if (!init_mm_ptr) {
                   pr_err("Failed to find init_mm");
                   return -ENODEV;
               }
-              pr_info("init_mm found at %px", init_mm_ptr);
+              
+              pr_info("init_mm resolved at %px", init_mm_ptr);
               hide_module();
-              pr_info("Module loaded successfully");
+              pr_info("Module loaded and hidden");
               return 0;
           }
 
@@ -135,40 +127,62 @@ jobs:
           
           cat > Makefile << 'ENDMAKE'
           obj-m += rw_universal.o
+          
+          all:
+          \tmake -C $(KERNEL_DIR) M=$(PWD) modules
+          
+          clean:
+          \tmake -C $(KERNEL_DIR) M=$(PWD) clean
           ENDMAKE
 
-      - name: Build
+      - name: Build Kernel and Module
         run: |
-          export PATH=$(pwd)/clang/bin:$PATH
+          export PATH="$(pwd)/clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
           
           cd kernel
-          make mrproper
+          
+          # Настройка конфигурации
           make CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
           
-          # Отключаем проверки
-          scripts/config --disable CONFIG_MODULE_SIG
-          scripts/config --disable CONFIG_MODULE_SIG_ALL
-          scripts/config --disable CONFIG_MODVERSIONS
-          scripts/config --enable CONFIG_MODULE_FORCE_LOAD
+          # Отключаем проверки через sed (надежнее для CI)
+          sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/g' .config
+          sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/g' .config
+          echo "# CONFIG_MODVERSIONS is not set" >> .config
           
           make CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          make CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
+          make CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc) modules_prepare
+          
+          echo "Kernel version:"
+          make kernelrelease
+          
           cd ..
           
           # Собираем модуль
-          make -C kernel M=$(pwd) CC=clang LLVM=1 LLVM_IAS=1 modules
+          make -C kernel M=$(pwd) CC=clang LLVM=1 LLVM_IAS=1 \
+               ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
           
+          echo "Module built successfully:"
           ls -lh rw_universal.ko
           file rw_universal.ko
           modinfo rw_universal.ko || true
+          
+          echo "Module info:"
+          readelf -h rw_universal.ko | grep Machine
+          strings rw_universal.ko | grep vermagic || echo "No vermagic found"
 
-      - name: Upload
+      - name: Strip Module (optional)
+        run: |
+          cp rw_universal.ko rw_universal_original.ko
+          aarch64-linux-gnu-strip --strip-unneeded rw_universal.ko || true
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal.ko
-          path: rw_universal.ko
+          name: rw_universal_module
+          path: |
+            rw_universal.ko
+            rw_universal_original.ko
