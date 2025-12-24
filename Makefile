@@ -1,18 +1,22 @@
+# Имя модуля
 obj-m += rw_universal.o
 
-KDIR  ?= $(shell pwd)/kernel/android12-5.10
-ARCH  ?= arm64
-CROSS_COMPILE ?= aarch64-linux-android21-
-CC    := clang
+# Определяем путь к ядру, если он не передан извне
+# В GitHub Actions мы будем передавать KDIR явно, но для локальной сборки оставим дефолт
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+# Настройки по умолчанию, если не переданы из командной строки
+ARCH ?= arm64
+
+# Если LLVM=1 не передан, пытаемся использовать стандартный кросс-компилятор
+# Но лучше всегда передавать LLVM=1 при вызове make
+ifndef LLVM
+    CROSS_COMPILE ?= aarch64-linux-gnu-
+    CC ?= gcc
+endif
 
 all:
-	$(MAKE) -C $(KDIR) \
-		ARCH=$(ARCH) \
-		CC=$(CC) \
-		CROSS_COMPILE=$(CROSS_COMPILE) \
-		M=$(PWD) \
-		modules
+\t$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-
+\t$(MAKE) -C $(KDIR) M=$(PWD) clean
