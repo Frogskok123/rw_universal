@@ -13,12 +13,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        # libssl-dev обязателен для работы скриптов подписи модулей ядра
         run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip libssl-dev
 
       - name: Clone AOSP kernel (Android 12 / 5.10)
         run: |
           mkdir -p kernel
+          # Глубина 1 для скорости
           git clone --depth=1 https://android.googlesource.com/kernel/common \
             -b android12-5.10 kernel/android12-5.10
 
@@ -33,28 +33,27 @@ jobs:
           cd kernel/android12-5.10
           export PATH=$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           
-          # 1. Создаем конфигурацию (.config)
+          # 1. Используем gki_defconfig вместо обычного defconfig
+          # Это критично для Android 12 GKI ядер
           make ARCH=arm64 \
                LLVM=1 \
                LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-android- \
-               defconfig
+               gki_defconfig
           
-          # 2. ВАЖНО: Генерируем asm-offsets.h и заголовки.
-          # Без этого шага сборка модуля падает с ошибкой 'awk: fatal: cannot open file...'
+          # 2. Используем цель 'prepare' вместо 'modules_prepare'
+          # Она принудительно генерирует asm-offsets.h, который нужен для stack-protector
           make ARCH=arm64 \
                LLVM=1 \
                LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-android- \
-               modules_prepare
+               prepare
 
       - name: Build module
         run: |
           export PATH=$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           
-          # Сборка внешнего модуля
-          # -C указывает путь к исходникам ядра
-          # M=$GITHUB_WORKSPACE указывает путь к вашему коду (корню репозитория)
+          # Сборка модуля
           make -C kernel/android12-5.10 \
                M=$GITHUB_WORKSPACE \
                ARCH=arm64 \
