@@ -28,10 +28,8 @@ jobs:
           echo "$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
       - name: Generate signing key
-        run: |
-          openssl req -new -nodes -utf8 -sha256 -days 36500 \
-            -config x509.genkey -outform DER -out signing_key.x509 \
-            -keyout signing_key.pem
+  run: openssl req -new -nodes -utf8 -sha256 -days 36500 -config x509.genkey -outform DER -out signing_key.x509 -keyout signing_key.pem
+
 
 
       - name: Build module
