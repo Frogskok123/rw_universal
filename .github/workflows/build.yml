@@ -13,11 +13,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip
+        # Добавляем libssl-dev для подписи модулей (scripts/sign-file)
+        run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip libssl-dev
 
       - name: Clone AOSP kernel
         run: |
           mkdir -p kernel
+          # Используем depth=1 для ускорения
           git clone --depth=1 https://android.googlesource.com/kernel/common \
             -b android12-5.10 kernel/android12-5.10
 
@@ -25,26 +27,43 @@ jobs:
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
           unzip -q android-ndk-r25c-linux.zip
+          rm android-ndk-r25c-linux.zip
 
       - name: Configure kernel
         run: |
           cd kernel/android12-5.10
-          export PATH=$PWD/../../android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-          make ARCH=arm64 CC=clang defconfig
-
+          
+          # Настраиваем PATH к инструментам LLVM
+          export PATH=$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+          
+          # LLVM=1 и LLVM_IAS=1 обязательны для ядер >= 5.10 с новым NDK
+          # CROSS_COMPILE теперь без версии API (просто триплет)
+          make ARCH=arm64 \
+               LLVM=1 \
+               LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-android- \
+               defconfig
 
       - name: Build module
         run: |
-          export PATH=$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-          export ARCH=arm64
-          export CC=clang
-          export CROSS_COMPILE=aarch64-linux-android21-
-          make -j$(nproc)
-
+          export PATH=$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+          
+          # Сборка модуля.
+          # -C указывает путь к ядру
+          # M=$GITHUB_WORKSPACE указывает, где лежат исходники вашего модуля (в корне репозитория)
+          make -C kernel/android12-5.10 \
+               M=$GITHUB_WORKSPACE \
+               ARCH=arm64 \
+               LLVM=1 \
+               LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-android- \
+               modules
+               
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rw_universal-unsigned.ko
+          # Проверьте, что модуль называется именно так. Обычно это имя_папки.ko или как в Makefile
           path: rw_universal.ko
 
       - name: Release
@@ -53,4 +72,3 @@ jobs:
         with:
           files: rw_universal.ko
           title: Release ${{ github.ref_name }}
-
