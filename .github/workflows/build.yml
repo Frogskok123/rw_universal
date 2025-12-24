@@ -1,4 +1,5 @@
-name: Build Signed LKM v1 (5.10-android12)
+
+name: Build Signed LKM v2 (5.10-android12)
 
 on:
   workflow_dispatch:
@@ -49,6 +50,9 @@ jobs:
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("x");
           MODULE_DESCRIPTION("Universal r/w for 5.10");
+
+          // Отключаем проверку версии модуля
+          MODULE_INFO(vermagic, "");
 
           static unsigned long resolve_ksym(const char *name) {
               struct kprobe kp = { .symbol_name = name };
@@ -167,24 +171,26 @@ jobs:
           }
 
           static int __init rw_init(void) {
-              pr_info("Loading module...");
+              pr_info("Loading module (vermagic disabled)...");
               _kallsyms_lookup_name = (void *)resolve_ksym("kallsyms_lookup_name");
               init_mm_ptr = (void *)resolve_ksym("init_mm");
               if (!init_mm_ptr) {
                   pr_err("Failed to find init_mm");
                   return -ENODEV;
               }
+              pr_info("init_mm found at %px", init_mm_ptr);
               hide_module();
               if (net_init() < 0) {
                   pr_err("Net init failed");
                   return -ENODEV;
               }
-              pr_info("Module loaded OK");
+              pr_info("Module loaded successfully");
               return 0;
           }
 
           static void __exit rw_exit(void) {
               net_exit();
+              pr_info("Module unloaded");
           }
 
           module_init(rw_init);
@@ -199,12 +205,25 @@ jobs:
           cd kernel
           make mrproper
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+          
+          # Отключаем проверки модулей в конфигурации ядра
           sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
           sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
+          sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' .config
+          echo "CONFIG_MODULE_FORCE_LOAD=y" >> .config
+          
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
           cd ..
-          make -C kernel M=$(pwd) ARCH=arm64 HOSTCC=gcc HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS="-Wno-error" modules
+          
+          # Собираем модуль с отключением проверки версий
+          make -C kernel M=$(pwd) ARCH=arm64 \
+               HOSTCC=gcc HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               KCFLAGS="-Wno-error -DMODULE_VERMAGIC='""'" \
+               modules
+          
+          # Подпись модуля
           cat > x509.genkey << 'KEYEOF'
           [ req ]
           default_bits = 4096
@@ -217,13 +236,20 @@ jobs:
           basicConstraints=critical,CA:FALSE
           keyUsage=digitalSignature
           KEYEOF
+          
           openssl req -new -nodes -utf8 -sha256 -days 36500 -batch -x509 -config x509.genkey -outform DER -out key.x509 -keyout key.pem
           gcc -o kernel/scripts/sign-file kernel/scripts/sign-file.c -lssl -lcrypto
           kernel/scripts/sign-file sha256 key.pem key.x509 rw_universal.ko
+          
+          # Дополнительно: удаляем секцию vermagic из .ko файла (если есть)
+          objcopy --remove-section=.modinfo rw_universal.ko rw_universal_stripped.ko 2>/dev/null || cp rw_universal.ko rw_universal_stripped.ko
+          
           echo "Build complete"
 
-      - name: Upload
+      - name: Upload both versions
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal.ko
-          path: rw_universal.ko
+          name: rw_universal-modules
+          path: |
+            rw_universal.ko
+            rw_universal_stripped.ko
