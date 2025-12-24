@@ -1,4 +1,4 @@
-name: Build Signed LKM (5.10-android12)
+name: Build Signed LKM v1 (5.10-android12)
 
 on:
   workflow_dispatch:
@@ -50,12 +50,12 @@ jobs:
           MODULE_AUTHOR("x");
           MODULE_DESCRIPTION("Universal r/w for 5.10");
 
-          static unsigned long kprobe_lookup_name(const char *name) {
+          static unsigned long resolve_ksym(const char *name) {
               struct kprobe kp = { .symbol_name = name };
               unsigned long addr;
               int ret = register_kprobe(&kp);
               if (ret < 0) {
-                  pr_err("kprobe register failed for %s: %d", name, ret);
+                  pr_err("kprobe failed for %s: %d", name, ret);
                   return 0;
               }
               addr = (unsigned long)kp.addr;
@@ -168,8 +168,8 @@ jobs:
 
           static int __init rw_init(void) {
               pr_info("Loading module...");
-              _kallsyms_lookup_name = (void *)kprobe_lookup_name("kallsyms_lookup_name");
-              init_mm_ptr = (void *)kprobe_lookup_name("init_mm");
+              _kallsyms_lookup_name = (void *)resolve_ksym("kallsyms_lookup_name");
+              init_mm_ptr = (void *)resolve_ksym("init_mm");
               if (!init_mm_ptr) {
                   pr_err("Failed to find init_mm");
                   return -ENODEV;
