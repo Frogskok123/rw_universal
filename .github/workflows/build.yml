@@ -1,4 +1,4 @@
-name: Build Kernel Module
+name: Builffd Kernel Module
 
 on:
   workflow_dispatch:
@@ -10,16 +10,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: Setup
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison build-essential flex git libelf-dev libssl-dev gcc-aarch64-linux-gnu
 
-      - name: Clone Kernel Source
+      - name: Clone Kernel
         run: |
           git clone --depth=1 https://android.googlesource.com/kernel/common -b android12-5.10 kernel
 
-      - name: Create Module Source
+      - name: Create Module
         run: |
           cat > rw_universal.c << 'ENDCODE'
           #define pr_fmt(fmt) "rw_universal: " fmt
@@ -32,6 +32,7 @@ jobs:
           #include <linux/pagewalk.h>
 
           MODULE_LICENSE("GPL");
+          MODULE_INFO(vermagic, "5.10.136-android12-9-g70d5edde7d3a SMP preempt mod_unload modversions aarch64");
 
           static struct mm_struct *init_mm_ptr = NULL;
 
@@ -78,23 +79,39 @@ jobs:
           
           echo "obj-m := rw_universal.o" > Makefile
 
-      - name: Build Module
+      - name: Build
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           cd kernel
+          
           make defconfig
+          
+          # Настраиваем под ваше ядро
           scripts/config --enable MODULES
           scripts/config --enable MODULE_UNLOAD
+          scripts/config --enable MODVERSIONS
           scripts/config --disable MODULE_SIG
-          scripts/config --disable MODVERSIONS
+          scripts/config --disable MODULE_SIG_ALL
+          scripts/config --disable MODULE_SIG_FORCE
+          scripts/config --set-str LOCALVERSION "-android12-9-g70d5edde7d3a"
+          
           make olddefconfig
+          
+          # Проверяем версию
+          make kernelrelease
+          
           make modules_prepare
           cd ..
+          
+          # Собираем модуль
           make -C kernel M=$PWD modules
+          
+          # Проверяем vermagic
+          modinfo rw_universal.ko | grep vermagic
           ls -lh rw_universal.ko
 
-      - name: Upload Module
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: rw_universal-ko
