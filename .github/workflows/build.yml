@@ -1,31 +1,27 @@
-
-name: Build bLKM for 5.10.136
+name: Build Kernel Module
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Setup Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev gcc-aarch64-linux-gnu
+          sudo apt-get install -y bc bison build-essential flex git libelf-dev libssl-dev gcc-aarch64-linux-gnu
 
-      - name: Clone Kernel
+      - name: Clone Kernel Source
         run: |
           git clone --depth=1 https://android.googlesource.com/kernel/common -b android12-5.10 kernel
 
-      - name: Create Files
+      - name: Create Module Source
         run: |
-          cat > rw_universal.c << 'EOF'
+          cat > rw_universal.c << 'ENDCODE'
           #define pr_fmt(fmt) "rw_universal: " fmt
           #include <linux/init.h>
           #include <linux/module.h>
@@ -37,6 +33,8 @@ jobs:
 
           MODULE_LICENSE("GPL");
 
+          static struct mm_struct *init_mm_ptr = NULL;
+
           static unsigned long resolve_ksym(const char *name) {
               struct kprobe kp = { .symbol_name = name };
               unsigned long addr;
@@ -46,8 +44,6 @@ jobs:
               pr_info("Found %s at %px", name, (void *)addr);
               return addr;
           }
-
-          static struct mm_struct *init_mm_ptr = NULL;
 
           typedef struct { phys_addr_t phys; bool valid; } v2p_t;
 
@@ -65,45 +61,41 @@ jobs:
 
           static int __init rw_init(void) {
               init_mm_ptr = (void *)resolve_ksym("init_mm");
-              if (!init_mm_ptr) return -ENODEV;
+              if (!init_mm_ptr) {
+                  pr_err("init_mm not found");
+                  return -ENODEV;
+              }
               list_del_init(&THIS_MODULE->list);
-              pr_info("Module loaded");
+              pr_info("Module loaded OK");
               return 0;
           }
 
-          static void __exit rw_exit(void) { }
+          static void __exit rw_exit(void) {}
 
           module_init(rw_init);
           module_exit(rw_exit);
-          EOF
+          ENDCODE
           
-          cat > Makefile << 'EOF'
-          obj-m := rw_universal.o
-          EOF
+          echo "obj-m := rw_universal.o" > Makefile
 
-      - name: Build
+      - name: Build Module
         run: |
-          cd kernel
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          
+          cd kernel
           make defconfig
-          echo "CONFIG_MODULES=y" >> .config
-          echo "CONFIG_MODULE_UNLOAD=y" >> .config
-          echo "# CONFIG_MODULE_SIG is not set" >> .config
-          echo "# CONFIG_MODVERSIONS is not set" >> .config
-          
+          scripts/config --enable MODULES
+          scripts/config --enable MODULE_UNLOAD
+          scripts/config --disable MODULE_SIG
+          scripts/config --disable MODVERSIONS
           make olddefconfig
           make modules_prepare
-          
           cd ..
           make -C kernel M=$PWD modules
-          
-          ls -lh *.ko
-          file rw_universal.ko
+          ls -lh rw_universal.ko
 
-      - name: Upload
+      - name: Upload Module
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal
+          name: rw_universal-ko
           path: rw_universal.ko
