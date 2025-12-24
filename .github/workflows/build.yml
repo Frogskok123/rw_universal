@@ -45,7 +45,7 @@
               return addr;
           }
 
-          // Резервный метод: поиск через экспортированные символы
+          
           static unsigned long lookup_name_fallback(const char *name) {
               unsigned long addr = 0;
               
