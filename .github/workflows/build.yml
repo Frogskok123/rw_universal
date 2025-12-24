@@ -1,5 +1,4 @@
-
-name: Build Signed LKM v2 (5.10-android12)
+name: Build LKM for 5.10.136-android12-9
 
 on:
   workflow_dispatch:
@@ -17,18 +16,24 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu
+          sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu flex bison
 
-      - name: Download Toolchain
+      - name: Download Clang 12.0.5
         run: |
-          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
-          rm clang/bin/ld
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz -O clang.tar.gz
+          mkdir clang
+          tar -xzf clang.tar.gz -C clang
+          rm clang.tar.gz
 
-      - name: Clone Kernel
+      - name: Clone Kernel (exact commit)
         run: |
           git clone --depth=1 https://android.googlesource.com/kernel/common -b android12-5.10 kernel
+          cd kernel
+          git fetch --depth=500
+          git checkout gc9f59ef34367 || echo "Commit not found, using latest android12-5.10"
+          cd ..
 
-      - name: Fix Source Code
+      - name: Create Module Source
         run: |
           cat > rw_universal.c << 'ENDOFFILE'
           // SPDX-License-Identifier: GPL-2.0
@@ -49,10 +54,7 @@ jobs:
 
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("x");
-          MODULE_DESCRIPTION("Universal r/w for 5.10");
-
-          // Отключаем проверку версии модуля
-          MODULE_INFO(vermagic, "");
+          MODULE_DESCRIPTION("Universal r/w");
 
           static unsigned long resolve_ksym(const char *name) {
               struct kprobe kp = { .symbol_name = name };
@@ -105,73 +107,12 @@ jobs:
               return rw_phys(p.phys, buf, len, write);
           }
 
-          #define CMD_READ  0x01
-          #define CMD_WRITE 0x02
-
-          typedef struct {
-              uint8_t cmd;
-              uint8_t reserved[3];
-              uint32_t size;
-              uint64_t addr;
-              uint8_t data[];
-          } __packed pkt_t;
-
-          static struct socket *sock = NULL;
-
-          static void udp_reply(struct sk_buff *skb, void *buf, size_t len) {
-              struct iphdr *iph;
-              struct udphdr *uh;
-              struct sockaddr_in to;
-              struct kvec iov;
-              struct msghdr msg;
-              iph = ip_hdr(skb);
-              uh = udp_hdr(skb);
-              memset(&to, 0, sizeof(to));
-              to.sin_family = AF_INET;
-              to.sin_port = uh->source;
-              to.sin_addr.s_addr = iph->saddr;
-              iov.iov_base = buf;
-              iov.iov_len = len;
-              memset(&msg, 0, sizeof(msg));
-              msg.msg_name = &to;
-              msg.msg_namelen = sizeof(to);
-              kernel_sendmsg(sock, &msg, &iov, 1, len);
-          }
-
-          static int udp_recv(struct sk_buff *skb) {
-              pkt_t *pkt;
-              uint8_t *buf;
-              if (skb->len < sizeof(pkt_t)) return 0;
-              pkt = (pkt_t *)skb->data;
-              buf = kmalloc(pkt->size, GFP_KERNEL);
-              if (!buf) return 0;
-              switch (pkt->cmd) {
-              case CMD_READ:
-                  rw_virt(pkt->addr, buf, pkt->size, false);
-                  udp_reply(skb, buf, pkt->size);
-                  break;
-              case CMD_WRITE:
-                  rw_virt(pkt->addr, pkt->data, pkt->size, true);
-                  break;
-              }
-              kfree(buf);
-              return 0;
-          }
-
-          static int net_init(void) {
-              return sock_create_kern(&init_net, AF_INET, SOCK_RAW, IPPROTO_UDP, &sock);
-          }
-
-          static void net_exit(void) {
-              if (sock) sock_release(sock);
-          }
-
           static void hide_module(void) {
               list_del_init(&THIS_MODULE->list);
           }
 
           static int __init rw_init(void) {
-              pr_info("Loading module (vermagic disabled)...");
+              pr_info("Loading module for 5.10.136");
               _kallsyms_lookup_name = (void *)resolve_ksym("kallsyms_lookup_name");
               init_mm_ptr = (void *)resolve_ksym("init_mm");
               if (!init_mm_ptr) {
@@ -180,76 +121,54 @@ jobs:
               }
               pr_info("init_mm found at %px", init_mm_ptr);
               hide_module();
-              if (net_init() < 0) {
-                  pr_err("Net init failed");
-                  return -ENODEV;
-              }
               pr_info("Module loaded successfully");
               return 0;
           }
 
           static void __exit rw_exit(void) {
-              net_exit();
               pr_info("Module unloaded");
           }
 
           module_init(rw_init);
           module_exit(rw_exit);
           ENDOFFILE
+          
+          cat > Makefile << 'ENDMAKE'
+          obj-m += rw_universal.o
+          ENDMAKE
 
       - name: Build
         run: |
           export PATH=$(pwd)/clang/bin:$PATH
           export ARCH=arm64
+          export SUBARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC=clang
+          
           cd kernel
           make mrproper
-          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+          make CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
           
-          # Отключаем проверки модулей в конфигурации ядра
-          sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
-          sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
-          sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' .config
-          echo "CONFIG_MODULE_FORCE_LOAD=y" >> .config
+          # Отключаем проверки
+          scripts/config --disable CONFIG_MODULE_SIG
+          scripts/config --disable CONFIG_MODULE_SIG_ALL
+          scripts/config --disable CONFIG_MODVERSIONS
+          scripts/config --enable CONFIG_MODULE_FORCE_LOAD
           
-          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
+          make CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          make CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
           cd ..
           
-          # Собираем модуль с отключением проверки версий
-          make -C kernel M=$(pwd) ARCH=arm64 \
-               HOSTCC=gcc HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- \
-               KCFLAGS="-Wno-error -DMODULE_VERMAGIC='""'" \
-               modules
+          # Собираем модуль
+          make -C kernel M=$(pwd) CC=clang LLVM=1 LLVM_IAS=1 modules
           
-          # Подпись модуля
-          cat > x509.genkey << 'KEYEOF'
-          [ req ]
-          default_bits = 4096
-          distinguished_name = req_distinguished_name
-          prompt = no
-          x509_extensions = myexts
-          [ req_distinguished_name ]
-          CN = Module
-          [ myexts ]
-          basicConstraints=critical,CA:FALSE
-          keyUsage=digitalSignature
-          KEYEOF
-          
-          openssl req -new -nodes -utf8 -sha256 -days 36500 -batch -x509 -config x509.genkey -outform DER -out key.x509 -keyout key.pem
-          gcc -o kernel/scripts/sign-file kernel/scripts/sign-file.c -lssl -lcrypto
-          kernel/scripts/sign-file sha256 key.pem key.x509 rw_universal.ko
-          
-          # Дополнительно: удаляем секцию vermagic из .ko файла (если есть)
-          objcopy --remove-section=.modinfo rw_universal.ko rw_universal_stripped.ko 2>/dev/null || cp rw_universal.ko rw_universal_stripped.ko
-          
-          echo "Build complete"
+          ls -lh rw_universal.ko
+          file rw_universal.ko
+          modinfo rw_universal.ko || true
 
-      - name: Upload both versions
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal-modules
-          path: |
-            rw_universal.ko
-            rw_universal_stripped.ko
+          name: rw_universal.ko
+          path: rw_universal.ko
