@@ -1,4 +1,4 @@
-name: Build Universal LKM (5.10-android12) – proton-clang
+name: Build Universal LKM (5.10-android12) - FIXED
 
 on:
   workflow_dispatch:
@@ -18,55 +18,50 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu
 
-      - name: Download Proton Clang
+      - name: Download Toolchain (Proton Clang)
         run: |
-          # Скачиваем проверенный toolchain, который содержит все нужные бинарники (clang, ld.lld и т.д.)
+          # Используем Proton Clang вместо NDK - это надежнее для ядер
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
 
-      - name: Clone AOSP Kernel
+      - name: Clone Kernel Source
         run: |
-          # Используем ветку android12-5.10
           git clone --depth=1 https://android.googlesource.com/kernel/common \
             -b android12-5.10 kernel
 
-      - name: Build Module
+      - name: Prepare Kernel & Build Module
         run: |
-          # Настройка переменных окружения
+          # Настраиваем переменные
           export PATH=$(pwd)/clang/bin:$PATH
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
           
-          # Переходим в ядро для подготовки
+          # 1. Подготовка ядра
           cd kernel
-          
-          # Очистка
           make mrproper
           
-          # Создаем конфигурацию GKI (Generic Kernel Image)
+          # Используем gki_defconfig (стандарт для Android 12)
           make CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
           
-          # === ВАЖНЫЕ ПАТЧИ КОНФИГА ===
-          # Отключаем подпись модулей, чтобы не требовались ключи
-          sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
-          sed -i 's/CONFIG_MODULE_SIG_ALL=y/CONFIG_MODULE_SIG_ALL=n/' .config
-          sed -i 's/CONFIG_MODULE_SIG_FORCE=y/CONFIG_MODULE_SIG_FORCE=n/' .config
-          
-          # Отключаем защиту стека (решает проблему с asm-offsets.h)
+          # === ПАТЧИ ДЛЯ ИСПРАВЛЕНИЯ ВАШЕЙ ОШИБКИ ===
+          # Отключаем защиту стека. Это убирает требование к asm-offsets.h для канарейки.
+          # Именно это исправит "clang-14: error: invalid value '' in 'mstack-protector-guard-offset='"
           sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
           sed -i 's/CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' .config
-
-          # Обновляем конфиг после правок
-          make CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
           
-          # Подготавливаем ядро (генерация заголовков)
+          # Отключаем подпись модулей для упрощения
+          sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
+          sed -i 's/CONFIG_MODULE_SIG_ALL=y/CONFIG_MODULE_SIG_ALL=n/' .config
+          
+          # Применяем изменения и готовим заголовки
+          make CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
           make CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
           
           # Возвращаемся в корень
           cd ..
           
-          # === СБОРКА МОДУЛЯ ===
-          # Используем переменные LLVM=1 для использования clang из PATH
+          # 2. Сборка вашего модуля
+          # Важно: передаем CC=clang LLVM=1 чтобы использовался наш тулчейн
           make -C $(pwd)/kernel \
                M=$(pwd) \
                ARCH=arm64 \
@@ -76,8 +71,8 @@ jobs:
                CROSS_COMPILE=aarch64-linux-gnu- \
                modules
           
-          # Очистка отладочной информации (уменьшает размер .ko)
-          $(pwd)/clang/bin/llvm-objcopy --strip-debug *.ko
+          # Очистка отладочной информации (strip)
+          $(pwd)/clang/bin/llvm-objcopy --strip-debug rw_universal.ko
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
