@@ -25,15 +25,16 @@ jobs:
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
           unzip -q android-ndk-r25c-linux.zip
-          echo "$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
       - name: Configure kernel
         run: |
           cd kernel/android12-5.10
+          export PATH=$PWD/../../android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           make ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-android21- defconfig
 
       - name: Build module
         run: |
+          export PATH=$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           export ARCH=arm64
           export CC=clang
           export CROSS_COMPILE=aarch64-linux-android21-
