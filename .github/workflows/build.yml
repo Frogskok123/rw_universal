@@ -1,4 +1,4 @@
-name: Build Universal LKM (5.10-android12) - FIXED v2
+name: Build Universal LKM (5.10-android12) - FIXED v3
 
 on:
   workflow_dispatch:
@@ -21,6 +21,12 @@ jobs:
       - name: Download Toolchain (Proton Clang)
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+          
+          # === ВАЖНЕЙШЕЕ ИСПРАВЛЕНИЕ ===
+          # Удаляем ld из скачанного clang, так как он слишком стар для Ubuntu 24.04
+          # и вызывает ошибку "unknown type section .relr.dyn".
+          # Теперь система будет вынуждена использовать системный /usr/bin/ld для хост-утилит.
+          rm clang/bin/ld
 
       - name: Clone Kernel Source
         run: |
@@ -29,7 +35,7 @@ jobs:
 
       - name: Prepare Kernel & Build Module
         run: |
-          # Настройка переменных окружения
+          # Добавляем clang в PATH, но ld там уже нет (мы его удалили)
           export PATH=$(pwd)/clang/bin:$PATH
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
@@ -38,20 +44,19 @@ jobs:
           cd kernel
           make mrproper
           
-          # 1. Конфигурация (gki_defconfig)
-          # HOSTCC/HOSTLD гарантируют использование системных утилит для хост-скриптов
+          # 1. Конфигурация
+          # Мы всё равно указываем HOSTLD=ld для верности, но теперь это точно сработает
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
                CC=clang LLVM=1 LLVM_IAS=1 \
                gki_defconfig
           
-          # 2. Патчи конфига: Отключаем защиту стека и подпись модулей
-          # Это предотвращает ошибки 'asm-offsets.h' и проблемы с ключами
+          # 2. Патчи конфига (отключение защиты)
           sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
           sed -i 's/CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' .config
           sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
           sed -i 's/CONFIG_MODULE_SIG_ALL=y/CONFIG_MODULE_SIG_ALL=n/' .config
           
-          # 3. Применяем изменения и готовим заголовки
+          # 3. Подготовка
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
                CC=clang LLVM=1 LLVM_IAS=1 \
                olddefconfig
@@ -62,8 +67,7 @@ jobs:
           
           cd ..
           
-          # 4. Сборка вашего модуля
-          # Используем те же флаги HOST*, чтобы избежать пересборки утилит неправильным линкером
+          # 4. Сборка модуля
           make -C $(pwd)/kernel \
                M=$(pwd) \
                ARCH=arm64 \
@@ -74,7 +78,7 @@ jobs:
                CROSS_COMPILE=aarch64-linux-gnu- \
                modules
           
-          # Очистка отладочной информации для уменьшения размера
+          # Очистка
           $(pwd)/clang/bin/llvm-objcopy --strip-debug rw_universal.ko
 
       - name: Upload Artifact
