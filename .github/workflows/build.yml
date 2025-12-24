@@ -1,5 +1,4 @@
-
-name: Build Signed LKM (5.10-android12) - WORKING
+name: Build Signed LKM (5.10-android12)
 
 on:
   workflow_dispatch:
