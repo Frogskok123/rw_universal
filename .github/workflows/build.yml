@@ -12,10 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install dependencies
+        # libssl-dev обязателен для работы скриптов подписи модулей ядра
         run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip libssl-dev
 
-      - name: Clone AOSP kernel
+      - name: Clone AOSP kernel (Android 12 / 5.10)
         run: |
           mkdir -p kernel
           git clone --depth=1 https://android.googlesource.com/kernel/common \
@@ -32,14 +33,15 @@ jobs:
           cd kernel/android12-5.10
           export PATH=$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           
-          # 1. Конфигурация
+          # 1. Создаем конфигурацию (.config)
           make ARCH=arm64 \
                LLVM=1 \
                LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-android- \
                defconfig
           
-          # 2. ВАЖНО: Подготовка заголовков для модулей
+          # 2. ВАЖНО: Генерируем asm-offsets.h и заголовки.
+          # Без этого шага сборка модуля падает с ошибкой 'awk: fatal: cannot open file...'
           make ARCH=arm64 \
                LLVM=1 \
                LLVM_IAS=1 \
@@ -50,6 +52,9 @@ jobs:
         run: |
           export PATH=$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           
+          # Сборка внешнего модуля
+          # -C указывает путь к исходникам ядра
+          # M=$GITHUB_WORKSPACE указывает путь к вашему коду (корню репозитория)
           make -C kernel/android12-5.10 \
                M=$GITHUB_WORKSPACE \
                ARCH=arm64 \
@@ -63,7 +68,7 @@ jobs:
         with:
           name: rw_universal.ko
           path: rw_universal.ko
-          
+
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
