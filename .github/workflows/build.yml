@@ -1,6 +1,35 @@
+name: Build Signed LKM (5.10-android12)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu
+
+      - name: Download Toolchain
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+          rm clang/bin/ld
+
+      - name: Clone Kernel
+        run: |
+          git clone --depth=1 https://android.googlesource.com/kernel/common -b android12-5.10 kernel
+
       - name: Fix Source Code
         run: |
-          cat <<'EOF' > rw_universal.c
+          cat > rw_universal.c << 'ENDOFFILE'
           // SPDX-License-Identifier: GPL-2.0
           #define pr_fmt(fmt) "rw_universal: " fmt
           #include <linux/init.h>
@@ -16,76 +45,25 @@
           #include <net/udp.h>
           #include <asm/pgtable.h>
           #include <linux/pagewalk.h>
-          #include <linux/version.h>
 
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("x");
           MODULE_DESCRIPTION("Universal r/w for 5.10");
 
-          // === Улучшенный поиск символов через kprobe ===
           static unsigned long kprobe_lookup_name(const char *name) {
-              struct kprobe kp = {
-                  .symbol_name = name,
-              };
+              struct kprobe kp = { .symbol_name = name };
               unsigned long addr;
-              int ret;
-
-              ret = register_kprobe(&kp);
+              int ret = register_kprobe(&kp);
               if (ret < 0) {
-                  pr_err("register_kprobe(%s) failed: %d
+                  pr_err("kprobe register failed for %s: %d
 ", name, ret);
                   return 0;
               }
-
               addr = (unsigned long)kp.addr;
               unregister_kprobe(&kp);
-              
-              pr_info("Found %s at %px via kprobe
+              pr_info("Found %s at %px
 ", name, (void *)addr);
               return addr;
-          }
-
-          
-          static unsigned long lookup_name_fallback(const char *name) {
-              unsigned long addr = 0;
-              
-          #ifdef CONFIG_KALLSYMS
-              // Пробуем напрямую (если повезет и символ экспортирован)
-              addr = kallsyms_lookup_name(name);
-              if (addr) {
-                  pr_info("Found %s at %px via direct kallsyms
-", name, (void *)addr);
-                  return addr;
-              }
-          #endif
-
-          #ifdef CONFIG_KALLSYMS_ALL
-              // Если CONFIG_KALLSYMS_ALL включен, можем использовать kallsyms_on_each_symbol
-              // (код опущен для краткости, можно добавить если нужно)
-          #endif
-
-              pr_err("Failed to find symbol: %s
-", name);
-              return 0;
-          }
-
-          // Универсальная функция поиска
-          static unsigned long resolve_symbol(const char *name) {
-              unsigned long addr;
-              
-              // Метод 1: kprobe
-              addr = kprobe_lookup_name(name);
-              if (addr)
-                  return addr;
-              
-              // Метод 2: fallback
-              addr = lookup_name_fallback(name);
-              if (addr)
-                  return addr;
-              
-              pr_err("All methods failed for: %s
-", name);
-              return 0;
           }
 
           static unsigned long (*_kallsyms_lookup_name)(const char *) = NULL;
@@ -144,34 +122,27 @@
               struct sockaddr_in to;
               struct kvec iov;
               struct msghdr msg;
-
               iph = ip_hdr(skb);
               uh = udp_hdr(skb);
-              
               memset(&to, 0, sizeof(to));
               to.sin_family = AF_INET;
               to.sin_port = uh->source;
               to.sin_addr.s_addr = iph->saddr;
-
               iov.iov_base = buf;
               iov.iov_len = len;
-
               memset(&msg, 0, sizeof(msg));
               msg.msg_name = &to;
               msg.msg_namelen = sizeof(to);
-
               kernel_sendmsg(sock, &msg, &iov, 1, len);
           }
 
           static int udp_recv(struct sk_buff *skb) {
               pkt_t *pkt;
               uint8_t *buf;
-
               if (skb->len < sizeof(pkt_t)) return 0;
               pkt = (pkt_t *)skb->data;
               buf = kmalloc(pkt->size, GFP_KERNEL);
               if (!buf) return 0;
-
               switch (pkt->cmd) {
               case CMD_READ:
                   rw_virt(pkt->addr, buf, pkt->size, false);
@@ -198,49 +169,67 @@
           }
 
           static int __init rw_init(void) {
-              pr_info("Module loading...
+              pr_info("Loading module...
 ");
-              
-              // Сначала находим kallsyms_lookup_name (если нужно для дальнейшего использования)
-              _kallsyms_lookup_name = (void *)resolve_symbol("kallsyms_lookup_name");
-              
-              // Находим init_mm (критически важен)
-              init_mm_ptr = (void *)resolve_symbol("init_mm");
-              
+              _kallsyms_lookup_name = (void *)kprobe_lookup_name("kallsyms_lookup_name");
+              init_mm_ptr = (void *)kprobe_lookup_name("init_mm");
               if (!init_mm_ptr) {
-                  pr_err("Failed to resolve init_mm (critical symbol)
+                  pr_err("Failed to find init_mm
 ");
                   return -ENODEV;
               }
-              
-              pr_info("init_mm resolved at: %px
-", init_mm_ptr);
-              
-              if (!_kallsyms_lookup_name) {
-                  pr_warn("kallsyms_lookup_name not found, some features may be limited
-");
-                  // Но продолжаем работу, т.к. init_mm найден
-              }
-
               hide_module();
-              
               if (net_init() < 0) {
-                  pr_err("Network init failed
+                  pr_err("Net init failed
 ");
                   return -ENODEV;
               }
-              
-              pr_info("Module loaded successfully
+              pr_info("Module loaded OK
 ");
               return 0;
           }
 
           static void __exit rw_exit(void) {
               net_exit();
-              pr_info("Module unloaded
-");
           }
 
           module_init(rw_init);
           module_exit(rw_exit);
-          EOF
+          ENDOFFILE
+
+      - name: Build
+        run: |
+          export PATH=$(pwd)/clang/bin:$PATH
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          cd kernel
+          make mrproper
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+          sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
+          sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
+          cd ..
+          make -C kernel M=$(pwd) ARCH=arm64 HOSTCC=gcc HOSTLD=ld CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS="-Wno-error" modules
+          cat > x509.genkey << 'KEYEOF'
+          [ req ]
+          default_bits = 4096
+          distinguished_name = req_distinguished_name
+          prompt = no
+          x509_extensions = myexts
+          [ req_distinguished_name ]
+          CN = Module
+          [ myexts ]
+          basicConstraints=critical,CA:FALSE
+          keyUsage=digitalSignature
+          KEYEOF
+          openssl req -new -nodes -utf8 -sha256 -days 36500 -batch -x509 -config x509.genkey -outform DER -out key.x509 -keyout key.pem
+          gcc -o kernel/scripts/sign-file kernel/scripts/sign-file.c -lssl -lcrypto
+          kernel/scripts/sign-file sha256 key.pem key.x509 rw_universal.ko
+          echo "Build complete"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw_universal.ko
+          path: rw_universal.ko
