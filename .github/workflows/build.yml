@@ -1,4 +1,5 @@
-name: Build LKM for 5.10.136-android12-9
+
+name: Build bLKM for 5.10.136
 
 on:
   workflow_dispatch:
@@ -10,51 +11,36 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential zip curl libssl-dev python3 git gcc-aarch64-linux-gnu flex bison libelf-dev
-
-      - name: Download Clang Toolchain
-        run: |
-          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
-          export PATH="$(pwd)/clang/bin:$PATH"
-          clang --version
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev gcc-aarch64-linux-gnu
 
       - name: Clone Kernel
         run: |
           git clone --depth=1 https://android.googlesource.com/kernel/common -b android12-5.10 kernel
 
-      - name: Create Module Source
+      - name: Create Files
         run: |
-          cat > rw_universal.c << 'ENDOFFILE'
-          // SPDX-License-Identifier: GPL-2.0
+          cat > rw_universal.c << 'EOF'
           #define pr_fmt(fmt) "rw_universal: " fmt
           #include <linux/init.h>
           #include <linux/module.h>
           #include <linux/mm.h>
-          #include <linux/uaccess.h>
           #include <linux/kallsyms.h>
           #include <linux/kprobes.h>
           #include <asm/pgtable.h>
           #include <linux/pagewalk.h>
 
           MODULE_LICENSE("GPL");
-          MODULE_AUTHOR("x");
-          MODULE_DESCRIPTION("Universal r/w");
-          MODULE_VERSION("1.0");
 
           static unsigned long resolve_ksym(const char *name) {
               struct kprobe kp = { .symbol_name = name };
               unsigned long addr;
-              int ret = register_kprobe(&kp);
-              if (ret < 0) {
-                  pr_err("kprobe failed for %s: %d", name, ret);
-                  return 0;
-              }
+              if (register_kprobe(&kp) < 0) return 0;
               addr = (unsigned long)kp.addr;
               unregister_kprobe(&kp);
               pr_info("Found %s at %px", name, (void *)addr);
@@ -77,112 +63,47 @@ jobs:
 
           static const struct mm_walk_ops v2p_walk_ops = { .pte_entry = walker };
 
-          static v2p_t slow_virt2phys(uint64_t vaddr) {
-              v2p_t res = {0};
-              walk_page_range(init_mm_ptr, vaddr, vaddr + 1, &v2p_walk_ops, &res);
-              return res;
-          }
-
-          static int rw_phys(phys_addr_t phys, void *buf, size_t len, bool write) {
-              void *vm = phys_to_virt(phys);
-              if (!vm) return -EFAULT;
-              if (write) memcpy(vm, buf, len);
-              else memcpy(buf, vm, len);
-              return 0;
-          }
-
-          static int rw_virt(uint64_t vaddr, void *buf, size_t len, bool write) {
-              v2p_t p = slow_virt2phys(vaddr);
-              if (!p.valid) return -EFAULT;
-              return rw_phys(p.phys, buf, len, write);
-          }
-
-          static void hide_module(void) {
-              list_del_init(&THIS_MODULE->list);
-              kobject_del(&THIS_MODULE->mkobj.kobj);
-          }
-
           static int __init rw_init(void) {
-              pr_info("Loading module for 5.10.136");
-              
               init_mm_ptr = (void *)resolve_ksym("init_mm");
-              if (!init_mm_ptr) {
-                  pr_err("Failed to find init_mm");
-                  return -ENODEV;
-              }
-              
-              pr_info("init_mm resolved at %px", init_mm_ptr);
-              hide_module();
-              pr_info("Module loaded and hidden");
+              if (!init_mm_ptr) return -ENODEV;
+              list_del_init(&THIS_MODULE->list);
+              pr_info("Module loaded");
               return 0;
           }
 
-          static void __exit rw_exit(void) {
-              pr_info("Module unloaded");
-          }
+          static void __exit rw_exit(void) { }
 
           module_init(rw_init);
           module_exit(rw_exit);
-          ENDOFFILE
+          EOF
           
-          cat > Makefile << 'ENDMAKE'
-          obj-m += rw_universal.o
-          
-          all:
-          \tmake -C $(KERNEL_DIR) M=$(PWD) modules
-          
-          clean:
-          \tmake -C $(KERNEL_DIR) M=$(PWD) clean
-          ENDMAKE
+          cat > Makefile << 'EOF'
+          obj-m := rw_universal.o
+          EOF
 
-      - name: Build Kernel and Module
+      - name: Build
         run: |
-          export PATH="$(pwd)/clang/bin:$PATH"
+          cd kernel
           export ARCH=arm64
-          export SUBARCH=arm64
-          export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          cd kernel
-          
-          # Настройка конфигурации
-          make CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
-          
-          # Отключаем проверки через sed (надежнее для CI)
-          sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/g' .config
-          sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/g' .config
+          make defconfig
+          echo "CONFIG_MODULES=y" >> .config
+          echo "CONFIG_MODULE_UNLOAD=y" >> .config
+          echo "# CONFIG_MODULE_SIG is not set" >> .config
           echo "# CONFIG_MODVERSIONS is not set" >> .config
           
-          make CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          make CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc) modules_prepare
-          
-          echo "Kernel version:"
-          make kernelrelease
+          make olddefconfig
+          make modules_prepare
           
           cd ..
+          make -C kernel M=$PWD modules
           
-          # Собираем модуль
-          make -C kernel M=$(pwd) CC=clang LLVM=1 LLVM_IAS=1 \
-               ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
-          
-          echo "Module built successfully:"
-          ls -lh rw_universal.ko
+          ls -lh *.ko
           file rw_universal.ko
-          modinfo rw_universal.ko || true
-          
-          echo "Module info:"
-          readelf -h rw_universal.ko | grep Machine
-          strings rw_universal.ko | grep vermagic || echo "No vermagic found"
 
-      - name: Strip Module (optional)
-        run: |
-          cp rw_universal.ko rw_universal_original.ko
-          aarch64-linux-gnu-strip --strip-unneeded rw_universal.ko || true
-
-      - name: Upload Artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal_module
-          path: |
-            rw_universal.ko
-            rw_universal_original.ko
+          name: rw_universal
+          path: rw_universal.ko
