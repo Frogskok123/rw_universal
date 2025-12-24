@@ -1,4 +1,4 @@
-name: Build Universal LKM (5.10-android12) - FIXED
+name: Build Universal LKM (5.10-android12) - FIXED v2
 
 on:
   workflow_dispatch:
@@ -20,7 +20,6 @@ jobs:
 
       - name: Download Toolchain (Proton Clang)
         run: |
-          # Используем Proton Clang вместо NDK - это надежнее для ядер
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
 
       - name: Clone Kernel Source
@@ -30,48 +29,52 @@ jobs:
 
       - name: Prepare Kernel & Build Module
         run: |
-          # Настраиваем переменные
+          # Настройка переменных окружения
           export PATH=$(pwd)/clang/bin:$PATH
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
           
-          # 1. Подготовка ядра
           cd kernel
           make mrproper
           
-          # Используем gki_defconfig (стандарт для Android 12)
-          make CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+          # 1. Конфигурация (gki_defconfig)
+          # HOSTCC/HOSTLD гарантируют использование системных утилит для хост-скриптов
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
+               CC=clang LLVM=1 LLVM_IAS=1 \
+               gki_defconfig
           
-          # === ПАТЧИ ДЛЯ ИСПРАВЛЕНИЯ ВАШЕЙ ОШИБКИ ===
-          # Отключаем защиту стека. Это убирает требование к asm-offsets.h для канарейки.
-          # Именно это исправит "clang-14: error: invalid value '' in 'mstack-protector-guard-offset='"
+          # 2. Патчи конфига: Отключаем защиту стека и подпись модулей
+          # Это предотвращает ошибки 'asm-offsets.h' и проблемы с ключами
           sed -i 's/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' .config
           sed -i 's/CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' .config
-          
-          # Отключаем подпись модулей для упрощения
           sed -i 's/CONFIG_MODULE_SIG=y/CONFIG_MODULE_SIG=n/' .config
           sed -i 's/CONFIG_MODULE_SIG_ALL=y/CONFIG_MODULE_SIG_ALL=n/' .config
           
-          # Применяем изменения и готовим заголовки
-          make CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          make CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
+          # 3. Применяем изменения и готовим заголовки
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
+               CC=clang LLVM=1 LLVM_IAS=1 \
+               olddefconfig
+               
+          make HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
+               CC=clang LLVM=1 LLVM_IAS=1 \
+               modules_prepare
           
-          # Возвращаемся в корень
           cd ..
           
-          # 2. Сборка вашего модуля
-          # Важно: передаем CC=clang LLVM=1 чтобы использовался наш тулчейн
+          # 4. Сборка вашего модуля
+          # Используем те же флаги HOST*, чтобы избежать пересборки утилит неправильным линкером
           make -C $(pwd)/kernel \
                M=$(pwd) \
                ARCH=arm64 \
+               HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld \
                CC=clang \
                LLVM=1 \
                LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- \
                modules
           
-          # Очистка отладочной информации (strip)
+          # Очистка отладочной информации для уменьшения размера
           $(pwd)/clang/bin/llvm-objcopy --strip-debug rw_universal.ko
 
       - name: Upload Artifact
