@@ -1,4 +1,4 @@
-name: Build & Sign Universal LKM (5.10-android12)
+name: Build Universal LKM (5.10-android12) – no sign
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip openssl
+        run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip
 
       - name: Clone AOSP kernel
         run: |
@@ -27,32 +27,21 @@ jobs:
           unzip -q android-ndk-r25c-linux.zip
           echo "$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Generate signing key
-  run: openssl req -new -nodes -utf8 -sha256 -days 36500 -config x509.genkey -outform DER -out signing_key.x509 -keyout signing_key.pem
-
-
-
       - name: Build module
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-android-
           make -j$(nproc)
 
-      - name: Sign module
-        run: kernel/android12-5.10/scripts/sign-file sha256 \
-             signing_key.pem signing_key.x509 rw_universal.ko
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rw_universal-signed.ko
+          name: rw_universal-unsigned.ko
           path: rw_universal.ko
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            rw_universal.ko
-            signing_key.x509
+          files: rw_universal.ko
           title: Release ${{ github.ref_name }}
