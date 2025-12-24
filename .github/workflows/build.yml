@@ -225,8 +225,13 @@ jobs:
           openssl req -new -nodes -utf8 -sha256 -days 36500 -batch -x509 \
             -config x509.genkey -outform DER -out key.x509 -keyout key.pem
           
-          make -C kernel/scripts sign-file HOSTCC=gcc HOSTLD=ld
+          # FIX: Компилируем sign-file с правильными флагами линковки
+          gcc -o kernel/scripts/sign-file kernel/scripts/sign-file.c \
+              -lssl -lcrypto -I/usr/include/openssl
+          
           kernel/scripts/sign-file sha256 key.pem key.x509 rw_universal.ko
+          
+          echo "Module signed successfully"
 
       - name: Upload
         uses: actions/upload-artifact@v4
