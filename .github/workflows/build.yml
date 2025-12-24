@@ -1,0 +1,58 @@
+name: Build & Sign Universal LKM (5.10-android12)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt update && sudo apt install -y git bc bison flex build-essential zip openssl
+
+      - name: Clone AOSP kernel
+        run: |
+          mkdir -p kernel
+          git clone --depth=1 https://android.googlesource.com/kernel/common \
+            -b android12-5.10 kernel/android12-5.10
+
+      - name: Install NDK r25c
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          unzip -q android-ndk-r25c-linux.zip
+          echo "$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Generate signing key
+        run: openssl req -new -nodes -utf8 -sha256 -days 36500 \
+             -config x509.genkey -outform DER -out signing_key.x509 \
+             -keyout signing_key.pem
+
+      - name: Build module
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-android-
+          make -j$(nproc)
+
+      - name: Sign module
+        run: kernel/android12-5.10/scripts/sign-file sha256 \
+             signing_key.pem signing_key.x509 rw_universal.ko
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw_universal-signed.ko
+          path: rw_universal.ko
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rw_universal.ko
+            signing_key.x509
+          title: Release ${{ github.ref_name }}
