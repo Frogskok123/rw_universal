@@ -83,8 +83,7 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
 int dispatch_open(struct inode *node, struct file *file) {
     file->private_data = &memdev;
     task = current;
-    // printk("Open device called by pid:%d
-", task->pid);
+     printk("Open device called by pid:%d", task->pid);
     return 0;
 }
 
@@ -113,7 +112,7 @@ static int __init driver_entry(void) {
 
     // Генерация случайного имени (заглушка или ваша функция)
     // devicename = get_rand_str(); 
-    devicename = "mem_driver"; // Временное имя, если get_rand_str нет
+    devicename = "mtk_tersafe"; // Временное имя, если get_rand_str нет
 
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
     if (ret < 0) return ret;
