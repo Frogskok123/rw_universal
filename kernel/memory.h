@@ -11,10 +11,10 @@
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>
 #include <linux/slab.h>
-#include <linux/mmap_lock.h> // Важно для блокировок
+#include <linux/mmap_lock.h>
 
 // ==========================================
-// 1. ДИНАМИЧЕСКИЙ ПОИСК ФУНКЦИЙ
+// 1. ПОИСК ФУНКЦИЙ
 // ==========================================
 
 typedef int (*valid_phys_addr_range_t)(phys_addr_t addr, size_t size);
@@ -35,26 +35,22 @@ static unsigned long lookup_symbol(const char *name) {
 }
 
 static void resolve_kernel_symbols(void) {
-    // Валидация
     g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("valid_phys_addr_range");
     if (!g_valid_phys_addr_range) {
         g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("memblock_is_map_memory");
     }
     
-    // Чтение (безопасное)
     g_probe_read = (probe_kernel_read_t)lookup_symbol("copy_from_kernel_nofault");
     if (!g_probe_read) g_probe_read = (probe_kernel_read_t)lookup_symbol("probe_kernel_read");
 
-    // Запись (безопасная)
     g_probe_write = (probe_kernel_write_t)lookup_symbol("copy_to_kernel_nofault");
     if (!g_probe_write) g_probe_write = (probe_kernel_write_t)lookup_symbol("probe_kernel_write");
 
-    if (g_valid_phys_addr_range) printk(KERN_INFO "JiangNight: validation found at %p", g_valid_phys_addr_range);
-    if (g_probe_read) printk(KERN_INFO "JiangNight: probe_read found at %p", g_probe_read);
+    if (g_valid_phys_addr_range) printk(KERN_INFO "JiangNight: Validation enabled");
 }
 
 // ==========================================
-// 2. ТРАНСЛЯЦИЯ (Должна вызываться под mmap_lock!)
+// 2. ТРАНСЛЯЦИЯ (С ПРОВЕРКОЙ MMIO)
 // ==========================================
 
 phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
@@ -64,6 +60,7 @@ phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
     pmd_t *pmd;
     pte_t *pte;
     
+    // 1. Проход по таблицам страниц
     pgd = pgd_offset(mm, va);
     if(pgd_none(*pgd) || pgd_bad(*pgd)) return 0;
 
@@ -77,37 +74,47 @@ phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
     if(pmd_none(*pmd)) return 0;
 
     pte = pte_offset_kernel(pmd, va);
+    
+    // 2. Критические проверки (Fix Kernel Panic)
     if(pte_none(*pte) || !pte_present(*pte)) return 0;
+
+    // НЕ ЧИТАТЬ СПЕЦИАЛЬНЫЕ СТРАНИЦЫ (Device Memory / MMIO)
+    // Это главная причина крашей при сканировании памяти
+    if (pte_special(*pte)) return 0; 
+    
+    // НЕ ЧИТАТЬ СТРАНИЦЫ УСТРОЙСТВ (GPU и т.д.)
+#ifdef pte_devmap
+    if (pte_devmap(*pte)) return 0;
+#endif
 
     return (phys_addr_t)(pte_pfn(*pte) << PAGE_SHIFT) + (va & (PAGE_SIZE - 1));
 }
 
 // ==========================================
-// 3. ФИЗИЧЕСКОЕ ЧТЕНИЕ/ЗАПИСЬ
+// 3. БЕЗОПАСНОЕ ЧТЕНИЕ/ЗАПИСЬ
 // ==========================================
 
 size_t read_physical_address(phys_addr_t pa, void* buffer, size_t size) {
     void* mapped;
     void* kbuf;
     
-    // Валидация адреса
     if (g_valid_phys_addr_range && !g_valid_phys_addr_range(pa, size)) return 0;
     if (!g_valid_phys_addr_range && !pfn_valid(__phys_to_pfn(pa))) return 0;
 
     mapped = (void*)phys_to_virt(pa);
     if (!mapped) return 0;
-
     if (!g_probe_read) return 0;
 
     kbuf = kmalloc(size, GFP_KERNEL);
     if (!kbuf) return 0;
 
-    // Читаем в буфер ядра БЕЗОПАСНО (без паники)
+    // Чтение в буфер ядра
     if (g_probe_read(kbuf, mapped, size) < 0) {
         kfree(kbuf);
         return 0; 
     }
 
+    // Копирование пользователю
     if (copy_to_user(buffer, kbuf, size)) {
         kfree(kbuf);
         return 0;
@@ -126,7 +133,6 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
 
     mapped = (void*)phys_to_virt(pa);
     if (!mapped) return 0;
-
     if (!g_probe_write) return 0;
 
     kbuf = kmalloc(size, GFP_KERNEL);
@@ -147,14 +153,15 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
 }
 
 // ==========================================
-// 4. ЧТЕНИЕ ПАМЯТИ ПРОЦЕССА (С БЛОКИРОВКОЙ)
+// 4. ЦИКЛ ОБРАБОТКИ
 // ==========================================
 
 bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
     struct task_struct* task;
     struct mm_struct* mm;
     phys_addr_t pa;
-    size_t max;
+    size_t chunk_size;
+    size_t processed = 0;
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -169,32 +176,34 @@ bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
         return false;
     }
 
-    // [ВАЖНО] Блокируем карту памяти от изменений во время чтения
-    // mmap_read_lock_killable возвращает 0 при успехе
-    if (mmap_read_lock_killable(mm)) {
-        mmput(mm);
-        put_task_struct(task);
-        return false;
-    }
-
     while (size > 0) {
-        // Трансляция безопасна только внутри блокировки mmap_read_lock
+        chunk_size = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
+        
+        // БЛОКИРОВКА ТОЛЬКО НА МОМЕНТ ТРАНСЛЯЦИИ
+        // Это предотвращает дедлоки с copy_to_user
+        if (mmap_read_lock_killable(mm)) {
+            break; // Если процесс умирает, выходим
+        }
+        
         pa = translate_linear_address(mm, addr);
-        max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
+        
+        mmap_read_unlock(mm); // Сразу разблокируем
 
         if (pa) {
-            read_physical_address(pa, buffer, max);
+            if (read_physical_address(pa, buffer, chunk_size) != chunk_size) {
+                 // Ошибка чтения физической памяти (но не паника!)
+                 if (clear_user(buffer, chunk_size)) { /* ignore */ }
+            }
         } else {
-            if (clear_user(buffer, max)) { }
+            // Страница не загружена или это спец. память
+            if (clear_user(buffer, chunk_size)) { /* ignore */ }
         }
 
-        size -= max;
-        buffer = (char*)buffer + max;
-        addr += max;
+        size -= chunk_size;
+        buffer = (char*)buffer + chunk_size;
+        addr += chunk_size;
+        processed += chunk_size;
     }
-
-    // [ВАЖНО] Снимаем блокировку
-    mmap_read_unlock(mm);
 
     mmput(mm);
     put_task_struct(task);
@@ -205,7 +214,7 @@ bool write_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) 
     struct task_struct* task;
     struct mm_struct* mm;
     phys_addr_t pa;
-    size_t max;
+    size_t chunk_size;
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -220,28 +229,21 @@ bool write_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) 
         return false;
     }
 
-    // [ВАЖНО] Блокируем карту памяти
-    if (mmap_read_lock_killable(mm)) {
-        mmput(mm);
-        put_task_struct(task);
-        return false;
-    }
-
     while (size > 0) {
+        chunk_size = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
+
+        if (mmap_read_lock_killable(mm)) break;
         pa = translate_linear_address(mm, addr);
-        max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
+        mmap_read_unlock(mm);
 
         if (pa) {
-            write_physical_address(pa, buffer, max);
+            write_physical_address(pa, buffer, chunk_size);
         }
 
-        size -= max;
-        buffer = (char*)buffer + max;
-        addr += max;
+        size -= chunk_size;
+        buffer = (char*)buffer + chunk_size;
+        addr += chunk_size;
     }
-
-    // [ВАЖНО] Снимаем блокировку
-    mmap_read_unlock(mm);
 
     mmput(mm);
     put_task_struct(task);
