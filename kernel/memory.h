@@ -35,11 +35,9 @@ static unsigned long lookup_symbol(const char *name) {
 bool resolve_kernel_symbols(void) {
     g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("valid_phys_addr_range");
     if (g_valid_phys_addr_range) {
-        printk(KERN_INFO "JiangNight: valid_phys_addr_range found at %p
-", g_valid_phys_addr_range);
+        printk(KERN_INFO "JiangNight: valid_phys_addr_range found at %p", g_valid_phys_addr_range);
     } else {
-        printk(KERN_WARNING "JiangNight: valid_phys_addr_range NOT found, falling back to pfn_valid
-");
+        printk(KERN_WARNING "JiangNight: valid_phys_addr_range NOT found, falling back to pfn_valid");
     }
     return true;
 }
