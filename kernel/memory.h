@@ -1,3 +1,4 @@
+
 #ifndef _MEMORY_H
 #define _MEMORY_H
 
@@ -10,17 +11,16 @@
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>
 #include <linux/slab.h>
+#include <linux/mmap_lock.h> // Важно для блокировок
 
 // ==========================================
-// 1. ДИНАМИЧЕСКИЙ ПОИСК ФУНКЦИЙ ЯДРА
+// 1. ДИНАМИЧЕСКИЙ ПОИСК ФУНКЦИЙ
 // ==========================================
 
-// Определяем типы функций
 typedef int (*valid_phys_addr_range_t)(phys_addr_t addr, size_t size);
 typedef long (*probe_kernel_read_t)(void *dst, const void *src, size_t size);
 typedef long (*probe_kernel_write_t)(void *dst, const void *src, size_t size);
 
-// Глобальные указатели
 static valid_phys_addr_range_t g_valid_phys_addr_range = NULL;
 static probe_kernel_read_t g_probe_read = NULL;
 static probe_kernel_write_t g_probe_write = NULL;
@@ -35,31 +35,26 @@ static unsigned long lookup_symbol(const char *name) {
 }
 
 static void resolve_kernel_symbols(void) {
-    // 1. Валидация
+    // Валидация
     g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("valid_phys_addr_range");
     if (!g_valid_phys_addr_range) {
         g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("memblock_is_map_memory");
     }
     
-    // 2. Чтение ядра (безопасное)
+    // Чтение (безопасное)
     g_probe_read = (probe_kernel_read_t)lookup_symbol("copy_from_kernel_nofault");
-    if (!g_probe_read) {
-        g_probe_read = (probe_kernel_read_t)lookup_symbol("probe_kernel_read");
-    }
+    if (!g_probe_read) g_probe_read = (probe_kernel_read_t)lookup_symbol("probe_kernel_read");
 
-    // 3. Запись ядра (безопасная)
+    // Запись (безопасная)
     g_probe_write = (probe_kernel_write_t)lookup_symbol("copy_to_kernel_nofault");
-    if (!g_probe_write) {
-        g_probe_write = (probe_kernel_write_t)lookup_symbol("probe_kernel_write");
-    }
+    if (!g_probe_write) g_probe_write = (probe_kernel_write_t)lookup_symbol("probe_kernel_write");
 
     if (g_valid_phys_addr_range) printk(KERN_INFO "JiangNight: validation found at %p", g_valid_phys_addr_range);
     if (g_probe_read) printk(KERN_INFO "JiangNight: probe_read found at %p", g_probe_read);
-    if (g_probe_write) printk(KERN_INFO "JiangNight: probe_write found at %p", g_probe_write);
 }
 
 // ==========================================
-// 2. ТРАНСЛЯЦИЯ
+// 2. ТРАНСЛЯЦИЯ (Должна вызываться под mmap_lock!)
 // ==========================================
 
 phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
@@ -88,26 +83,26 @@ phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
 }
 
 // ==========================================
-// 3. ЧТЕНИЕ / ЗАПИСЬ (ЧЕРЕЗ НАЙДЕННЫЕ ФУНКЦИИ)
+// 3. ФИЗИЧЕСКОЕ ЧТЕНИЕ/ЗАПИСЬ
 // ==========================================
 
 size_t read_physical_address(phys_addr_t pa, void* buffer, size_t size) {
     void* mapped;
     void* kbuf;
     
+    // Валидация адреса
     if (g_valid_phys_addr_range && !g_valid_phys_addr_range(pa, size)) return 0;
     if (!g_valid_phys_addr_range && !pfn_valid(__phys_to_pfn(pa))) return 0;
 
     mapped = (void*)phys_to_virt(pa);
     if (!mapped) return 0;
 
-    // Если функцию чтения не нашли - ничего не поделаешь, выходим
     if (!g_probe_read) return 0;
 
     kbuf = kmalloc(size, GFP_KERNEL);
     if (!kbuf) return 0;
 
-    // Вызываем найденную функцию по указателю
+    // Читаем в буфер ядра БЕЗОПАСНО (без паники)
     if (g_probe_read(kbuf, mapped, size) < 0) {
         kfree(kbuf);
         return 0; 
@@ -142,7 +137,6 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
         return 0;
     }
 
-    // Вызываем найденную функцию по указателю
     if (g_probe_write(mapped, kbuf, size) < 0) {
         kfree(kbuf);
         return 0;
@@ -151,6 +145,10 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
     kfree(kbuf);
     return size;
 }
+
+// ==========================================
+// 4. ЧТЕНИЕ ПАМЯТИ ПРОЦЕССА (С БЛОКИРОВКОЙ)
+// ==========================================
 
 bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
     struct task_struct* task;
@@ -171,7 +169,16 @@ bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
         return false;
     }
 
+    // [ВАЖНО] Блокируем карту памяти от изменений во время чтения
+    // mmap_read_lock_killable возвращает 0 при успехе
+    if (mmap_read_lock_killable(mm)) {
+        mmput(mm);
+        put_task_struct(task);
+        return false;
+    }
+
     while (size > 0) {
+        // Трансляция безопасна только внутри блокировки mmap_read_lock
         pa = translate_linear_address(mm, addr);
         max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
 
@@ -185,6 +192,9 @@ bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
         buffer = (char*)buffer + max;
         addr += max;
     }
+
+    // [ВАЖНО] Снимаем блокировку
+    mmap_read_unlock(mm);
 
     mmput(mm);
     put_task_struct(task);
@@ -210,6 +220,13 @@ bool write_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) 
         return false;
     }
 
+    // [ВАЖНО] Блокируем карту памяти
+    if (mmap_read_lock_killable(mm)) {
+        mmput(mm);
+        put_task_struct(task);
+        return false;
+    }
+
     while (size > 0) {
         pa = translate_linear_address(mm, addr);
         max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
@@ -222,6 +239,9 @@ bool write_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) 
         buffer = (char*)buffer + max;
         addr += max;
     }
+
+    // [ВАЖНО] Снимаем блокировку
+    mmap_read_unlock(mm);
 
     mmput(mm);
     put_task_struct(task);
