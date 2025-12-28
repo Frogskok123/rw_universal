@@ -11,10 +11,19 @@
 #include <linux/kprobes.h>
 #include <linux/slab.h>
 
-// --- KPROBES & VALIDATION ---
+// ==========================================
+// 1. ДИНАМИЧЕСКИЙ ПОИСК ФУНКЦИЙ ЯДРА
+// ==========================================
 
+// Определяем типы функций
 typedef int (*valid_phys_addr_range_t)(phys_addr_t addr, size_t size);
+typedef long (*probe_kernel_read_t)(void *dst, const void *src, size_t size);
+typedef long (*probe_kernel_write_t)(void *dst, const void *src, size_t size);
+
+// Глобальные указатели
 static valid_phys_addr_range_t g_valid_phys_addr_range = NULL;
+static probe_kernel_read_t g_probe_read = NULL;
+static probe_kernel_write_t g_probe_write = NULL;
 
 static unsigned long lookup_symbol(const char *name) {
     struct kprobe kp = { .symbol_name = name };
@@ -26,16 +35,32 @@ static unsigned long lookup_symbol(const char *name) {
 }
 
 static void resolve_kernel_symbols(void) {
+    // 1. Валидация
     g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("valid_phys_addr_range");
     if (!g_valid_phys_addr_range) {
         g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("memblock_is_map_memory");
     }
-    if (g_valid_phys_addr_range) {
-        printk(KERN_INFO "JiangNight: Validation function found at %p", g_valid_phys_addr_range);
+    
+    // 2. Чтение ядра (безопасное)
+    g_probe_read = (probe_kernel_read_t)lookup_symbol("copy_from_kernel_nofault");
+    if (!g_probe_read) {
+        g_probe_read = (probe_kernel_read_t)lookup_symbol("probe_kernel_read");
     }
+
+    // 3. Запись ядра (безопасная)
+    g_probe_write = (probe_kernel_write_t)lookup_symbol("copy_to_kernel_nofault");
+    if (!g_probe_write) {
+        g_probe_write = (probe_kernel_write_t)lookup_symbol("probe_kernel_write");
+    }
+
+    if (g_valid_phys_addr_range) printk(KERN_INFO "JiangNight: validation found at %p", g_valid_phys_addr_range);
+    if (g_probe_read) printk(KERN_INFO "JiangNight: probe_read found at %p", g_probe_read);
+    if (g_probe_write) printk(KERN_INFO "JiangNight: probe_write found at %p", g_probe_write);
 }
 
-// --- TRANSLATION ---
+// ==========================================
+// 2. ТРАНСЛЯЦИЯ
+// ==========================================
 
 phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
     pgd_t *pgd;
@@ -62,38 +87,32 @@ phys_addr_t translate_linear_address(struct mm_struct* mm, uintptr_t va) {
     return (phys_addr_t)(pte_pfn(*pte) << PAGE_SHIFT) + (va & (PAGE_SIZE - 1));
 }
 
-// --- SAFE R/W OPERATIONS ---
+// ==========================================
+// 3. ЧТЕНИЕ / ЗАПИСЬ (ЧЕРЕЗ НАЙДЕННЫЕ ФУНКЦИИ)
+// ==========================================
 
 size_t read_physical_address(phys_addr_t pa, void* buffer, size_t size) {
     void* mapped;
     void* kbuf;
     
-    // 1. Validate Address
-    if (g_valid_phys_addr_range) {
-        if (!g_valid_phys_addr_range(pa, size)) return 0;
-    } else {
-        if (!pfn_valid(__phys_to_pfn(pa))) return 0;
-    }
+    if (g_valid_phys_addr_range && !g_valid_phys_addr_range(pa, size)) return 0;
+    if (!g_valid_phys_addr_range && !pfn_valid(__phys_to_pfn(pa))) return 0;
 
-    // 2. Map (phys_to_virt is safer for RAM than ioremap)
     mapped = (void*)phys_to_virt(pa);
     if (!mapped) return 0;
 
-    // 3. Allocate Temp Buffer (Never copy directly to user from unsafe source)
+    // Если функцию чтения не нашли - ничего не поделаешь, выходим
+    if (!g_probe_read) return 0;
+
     kbuf = kmalloc(size, GFP_KERNEL);
     if (!kbuf) return 0;
 
-    // 4. Safe Copy from Kernel Memory (Prevents Panic)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    if (copy_from_kernel_nofault(kbuf, mapped, size) < 0) {
-#else
-    if (probe_kernel_read(kbuf, mapped, size) < 0) {
-#endif
+    // Вызываем найденную функцию по указателю
+    if (g_probe_read(kbuf, mapped, size) < 0) {
         kfree(kbuf);
         return 0; 
     }
 
-    // 5. Copy to User
     if (copy_to_user(buffer, kbuf, size)) {
         kfree(kbuf);
         return 0;
@@ -113,6 +132,8 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
     mapped = (void*)phys_to_virt(pa);
     if (!mapped) return 0;
 
+    if (!g_probe_write) return 0;
+
     kbuf = kmalloc(size, GFP_KERNEL);
     if (!kbuf) return 0;
 
@@ -121,11 +142,8 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
         return 0;
     }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    if (copy_to_kernel_nofault(mapped, kbuf, size) < 0) {
-#else
-    if (probe_kernel_write(mapped, kbuf, size) < 0) {
-#endif
+    // Вызываем найденную функцию по указателю
+    if (g_probe_write(mapped, kbuf, size) < 0) {
         kfree(kbuf);
         return 0;
     }
@@ -139,7 +157,6 @@ bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
     struct mm_struct* mm;
     phys_addr_t pa;
     size_t max;
-    size_t count = 0;
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -159,14 +176,13 @@ bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
         max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
 
         if (pa) {
-            count = read_physical_address(pa, buffer, max);
+            read_physical_address(pa, buffer, max);
         } else {
-            // Fill with zeros if page not mapped to avoid offset drift
-            if (clear_user(buffer, max)) { /* ignore error */ }
+            if (clear_user(buffer, max)) { }
         }
 
         size -= max;
-        buffer = (char*)buffer + max; // Fix pointer arithmetic
+        buffer = (char*)buffer + max;
         addr += max;
     }
 
