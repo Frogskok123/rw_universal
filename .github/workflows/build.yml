@@ -46,7 +46,7 @@ jobs:
         
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o memory.o process.o
+        jiangnight-objs := entry.o 
         EOF
         
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
