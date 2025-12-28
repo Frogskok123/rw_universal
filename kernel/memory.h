@@ -31,8 +31,7 @@ static void resolve_kernel_symbols(void) {
         g_valid_phys_addr_range = (valid_phys_addr_range_t)lookup_symbol("memblock_is_map_memory");
     }
     if (g_valid_phys_addr_range) {
-        printk(KERN_INFO "JiangNight: Validation function found at %p
-", g_valid_phys_addr_range);
+        printk(KERN_INFO "JiangNight: Validation function found at %p", g_valid_phys_addr_range);
     }
 }
 
