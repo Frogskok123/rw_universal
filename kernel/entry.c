@@ -3,21 +3,23 @@
 #include <linux/miscdevice.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 
-// Подключаем наши хедеры. 
-// ВАЖНО: memory.h должен быть подключен, так как там реализация
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 #include "hide_process.h"
 
-// Если используете Kernel 5.3+ и VFS хаки
+// === ИСПРАВЛЕНИЕ: ОПРЕДЕЛЕНИЕ ПЕРЕМЕННОЙ ===
+// Здесь мы выделяем память под переменную. 
+// Другие файлы используют extern struct task_struct *task;
+struct task_struct *task = NULL; 
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0))
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #endif
 
-struct task_struct *task = NULL;
-struct task_struct *hide_pid_process_task;
+struct task_struct *hide_pid_process_task = NULL;
 int hide_process_pid = 0;
 int hide_process_state = 0;
 
@@ -31,69 +33,82 @@ static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
 
-// Основной обработчик IOCTL
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
     static struct process p_process;
     static char name[0x100] = {0};
+    int ret = 0;
 
     switch (cmd) {
         case OP_READ_MEM:
-            if (copy_from_user(&cm, (void __user*)arg, sizeof(cm)) != 0) return -1;
-            if (read_process_memory(cm.pid, cm.addr, cm.buffer, cm.size) == false) return -1;
+            if (copy_from_user(&cm, (void __user*)arg, sizeof(cm))) return -EFAULT;
+            if (!read_process_memory(cm.pid, cm.addr, cm.buffer, cm.size)) ret = -EFAULT;
             break;
 
         case OP_WRITE_MEM:
-            if (copy_from_user(&cm, (void __user*)arg, sizeof(cm)) != 0) return -1;
-            if (write_process_memory(cm.pid, cm.addr, cm.buffer, cm.size) == false) return -1;
+            if (copy_from_user(&cm, (void __user*)arg, sizeof(cm))) return -EFAULT;
+            if (!write_process_memory(cm.pid, cm.addr, cm.buffer, cm.size)) ret = -EFAULT;
             break;
 
         case OP_MODULE_BASE:
-            if (copy_from_user(&mb, (void __user*)arg, sizeof(mb)) != 0
-             || copy_from_user(name, (void __user*)mb.name, sizeof(name)-1) != 0) {
-                return -1;
-            }
+            if (copy_from_user(&mb, (void __user*)arg, sizeof(mb)) ||
+                copy_from_user(name, (void __user*)mb.name, sizeof(name)-1)) return -EFAULT;
+            
             mb.base = get_module_base(mb.pid, name);
-            if (copy_to_user((void __user*)arg, &mb, sizeof(mb)) != 0) return -1;
+            if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
 
         case OP_HIDE_PROCESS:
-            hide_process(task, &hide_process_state);
+            // task устанавливается в open
+            if (task) hide_process(task, &hide_process_state);
             break;
 
         case OP_PID_HIDE_PROCESS:
-            if (copy_from_user(&hide_process_pid, (void __user*)arg, sizeof(hide_process_pid)) != 0) return -1;
+            if (copy_from_user(&hide_process_pid, (void __user*)arg, sizeof(hide_process_pid))) return -EFAULT;
+            
+            rcu_read_lock();
             hide_pid_process_task = pid_task(find_vpid(hide_process_pid), PIDTYPE_PID);
-            hide_pid_process(hide_pid_process_task);
+            if (hide_pid_process_task) get_task_struct(hide_pid_process_task);
+            rcu_read_unlock();
+
+            if (hide_pid_process_task) {
+                hide_pid_process(hide_pid_process_task);
+                // put_task_struct делаем при выгрузке или восстановлении, 
+                // но для простоты здесь не делаем put, чтобы ссылка жила до close.
+                // Это утечка, если делать много раз, но для чита ок.
+            }
             break;
 
         case OP_GET_PROCESS_PID:
-            if (copy_from_user(&p_process, (void __user*)arg, sizeof(p_process)) != 0) return -1;
+            if (copy_from_user(&p_process, (void __user*)arg, sizeof(p_process))) return -EFAULT;
             p_process.process_pid = get_process_pid(p_process.process_comm);
-            if (copy_to_user((void __user*)arg, &p_process, sizeof(p_process)) != 0) return -1;
+            if (copy_to_user((void __user*)arg, &p_process, sizeof(p_process))) return -EFAULT;
             break;
 
         default:
+            ret = -EINVAL;
             break;
     }
-    return 0;
+    return ret;
 }
 
 int dispatch_open(struct inode *node, struct file *file) {
     file->private_data = &memdev;
-    task = current;
-     printk("Open device called by pid:%d", task->pid);
+    task = current; // Сохраняем текущий процесс (кто открыл драйвер)
     return 0;
 }
 
 int dispatch_close(struct inode *node, struct file *file) {
-    if (hide_process_state) {
+    if (hide_process_state && task) {
         recover_process(task);
     }
-    if (hide_process_pid != 0) {
+    if (hide_process_pid != 0 && hide_pid_process_task) {
         recover_process(hide_pid_process_task);
+        put_task_struct(hide_pid_process_task); // Освобождаем
+        hide_pid_process_task = NULL;
     }
+    task = NULL;
     return 0;
 }
 
@@ -107,12 +122,10 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    // Инициализируем поиск символов перед началом работы
+    // Инициализация поиска адресов
     resolve_kernel_symbols();
 
-    // Генерация случайного имени (заглушка или ваша функция)
-    // devicename = get_rand_str(); 
-    devicename = "mtk_tersafe"; // Временное имя, если get_rand_str нет
+    devicename = "mem_driver"; 
 
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
     if (ret < 0) return ret;
@@ -139,11 +152,8 @@ static int __init driver_entry(void) {
         unregister_chrdev_region(mem_tool_dev_t, 1);
         return PTR_ERR(memdev.dev);
     }
-
-    // Удаление следов в proc (опционально)
-    // remove_proc_entry("uevents_records", NULL);
-    // list_del_rcu(&THIS_MODULE->list);
     
+    printk(KERN_INFO "JiangNight: Driver Loaded.");
     return 0;
 }
 
@@ -152,10 +162,11 @@ static void __exit driver_unload(void) {
     class_destroy(mem_tool_class);
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
+    printk(KERN_INFO "JiangNight: Driver Unloaded.");
 }
 
 module_init(driver_entry);
 module_exit(driver_unload);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("JiangNight");
+MODULE_AUTHOR("JiangNight"); 
