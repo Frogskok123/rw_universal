@@ -61,13 +61,21 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             break;
 
 case OP_SET_HW_BP:
-            if (copy_from_user(&bp_args, (void __user*)arg, sizeof(bp_args))) return -EFAULT;
-            
-            // Вызываем функцию установки
-            if (install_breakpoint(bp_args.pid, bp_args.addr, bp_args.type) < 0) {
-                return -EFAULT;
-            }
-            break;
+        if (copy_from_user(&bp_args, (void __user*)arg, sizeof(bp_args))) return -EFAULT;
+        // Используем новую функцию с возвратом ошибок
+        ret = install_breakpoint(bp_args.pid, bp_args.addr, bp_args.type);
+        // ret уже содержит код ошибки или 0
+        break;
+
+    case OP_DEL_HW_BP:
+        if (copy_from_user(&bp_args, (void __user*)arg, sizeof(bp_args))) return -EFAULT;
+        ret = remove_breakpoint(bp_args.pid, bp_args.addr);
+        break;
+
+    case OP_GET_DEBUG_EVENT:
+        // arg - указатель на буфер DEBUG_EVENT в user-space
+        ret = get_debug_event_fw(arg);
+        break;
         
         case OP_HIDE_PROCESS:
             // task устанавливается в open
@@ -135,6 +143,8 @@ static int __init driver_entry(void) {
     // Инициализация поиска адресов
     resolve_kernel_symbols();
 
+    init_breakpoint_system(); // Инициализация списков и FIFO
+    printk(KERN_INFO "JiangNight: Debug System Initialized.");
     devicename = "mem_driver"; 
 
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
@@ -168,6 +178,7 @@ static int __init driver_entry(void) {
 }
 
 static void __exit driver_unload(void) {
+    remove_all_breakpoints(); // Очистка всех висящих BP
     device_destroy(mem_tool_class, mem_tool_dev_t);
     class_destroy(mem_tool_class);
     cdev_del(&memdev.cdev);
