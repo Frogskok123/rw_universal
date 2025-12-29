@@ -15,7 +15,7 @@
 // === Настройки FIFO ===
 // Размер буфера (должен быть степенью двойки)
 // 1024 * 288 байт (примерно) = ~294 КБ
-#define FIFO_SIZE (1024 * sizeof(DEBUG_EVENT))
+#define FIFO_SIZE (128 * sizeof(DEBUG_EVENT))
 
 // Используем указатель на FIFO (динамическое выделение)
 static struct kfifo debug_events;
