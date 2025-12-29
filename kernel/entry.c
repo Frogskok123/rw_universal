@@ -9,7 +9,7 @@
 #include "memory.h"
 #include "process.h"
 #include "hide_process.h"
-
+#include "breakpoint.h"
 // === ИСПРАВЛЕНИЕ: ОПРЕДЕЛЕНИЕ ПЕРЕМЕННОЙ ===
 // Здесь мы выделяем память под переменную. 
 // Другие файлы используют extern struct task_struct *task;
@@ -36,6 +36,7 @@ const char *devicename;
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
+    static HW_BP bp_args; // Переменная для аргументов
     static struct process p_process;
     static char name[0x100] = {0};
     int ret = 0;
@@ -59,6 +60,15 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
 
+case OP_SET_HW_BP:
+            if (copy_from_user(&bp_args, (void __user*)arg, sizeof(bp_args))) return -EFAULT;
+            
+            // Вызываем функцию установки
+            if (install_breakpoint(bp_args.pid, bp_args.addr, bp_args.type) < 0) {
+                return -EFAULT;
+            }
+            break;
+        
         case OP_HIDE_PROCESS:
             // task устанавливается в open
             if (task) hide_process(task, &hide_process_state);
