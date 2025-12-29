@@ -179,6 +179,7 @@ static int __init driver_entry(void) {
 
 static void __exit driver_unload(void) {
     remove_all_breakpoints(); // Очистка всех висящих BP
+    cleanup_breakpoint_system(); // <-- Добавить это
     device_destroy(mem_tool_class, mem_tool_dev_t);
     class_destroy(mem_tool_class);
     cdev_del(&memdev.cdev);
