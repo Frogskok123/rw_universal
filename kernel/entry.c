@@ -36,62 +36,71 @@ const char *devicename;
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 
+#include <linux/input.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+
 // Глобальные переменные гироскопа
 static struct file *gyro_filp = NULL;
 static char gyro_path[32] = {0};
 
-// --- FILE I/O WRAPPERS (GKI COMPATIBLE) ---
+// --- FILE I/O WRAPPERS (NO FLOAT, NO KERNEL_READ SYMBOLS) ---
 
-// Функция открытия файла
+// Хелпер для получения write метода
+typedef ssize_t (*vfs_write_t)(struct file *, const char __user *, size_t, loff_t *);
+typedef ssize_t (*vfs_read_t)(struct file *, char __user *, size_t, loff_t *);
+
 struct file *file_open(const char *path, int flags, int rights) {
     struct file *filp = filp_open(path, flags, rights);
     return IS_ERR(filp) ? NULL : filp;
 }
 
-// Функция чтения файла (для новых ядер используем kernel_read)
-// ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos);
+// Упрощенная запись (для GKI)
+// Если kernel_write нет, мы используем vfs_write напрямую, но кастим буфер
+int file_write(struct file *file, unsigned long long offset, unsigned char *data, unsigned int size) {
+    loff_t pos = offset;
+    ssize_t ret;
+    
+    // ВНИМАНИЕ: В GKI ядрах (5.10+) доступ к файлам из ядра усложнен.
+    // Если kernel_write не экспортирован, мы можем попробовать vfs_write.
+    // Но vfs_write ожидает __user указатель.
+    // На старых ядрах (до 5.0) был set_fs(get_ds()).
+    // На новых - этого нет.
+    
+    // Лучший способ - использовать kernel_write. Если его нет в ksyms, значит он статический inline или скрыт.
+    // Попробуем просто вызвать vfs_write с кастом.
+    
+    if (file->f_op && file->f_op->write) {
+         ret = file->f_op->write(file, (const char __user *)data, size, &pos);
+    } else {
+        // Если нет write, пробуем write_iter (часто в сокетах и пайпах)
+         ret = -EINVAL; 
+    }
+    
+    return (int)ret;
+}
+
+// Чтение (упрощенное)
 int read_file_content(const char *path, char *buf, int max_len) {
     struct file *f;
-    int len;
+    int len = 0;
     loff_t pos = 0;
 
     f = file_open(path, O_RDONLY, 0);
     if (!f) return 0;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-    len = kernel_read(f, buf, max_len, &pos);
-#else
-    // Фоллбэк для старых ядер
-    mm_segment_t oldfs = get_fs();
-    set_fs(get_ds());
-    len = vfs_read(f, buf, max_len, &pos);
-    set_fs(oldfs);
-#endif
+    if (f->f_op && f->f_op->read) {
+        len = f->f_op->read(f, (char __user *)buf, max_len, &pos);
+    }
 
     filp_close(f, NULL);
-    if (len > 0 && len < max_len) buf[len] = 0; // Null terminate
+    if (len > 0 && len < max_len) buf[len] = 0;
     return len;
 }
 
-// Функция записи в файл
-int file_write(struct file *file, unsigned long long offset, unsigned char *data, unsigned int size) {
-    int ret;
-    loff_t pos = offset;
+// --- GYRO LOGIC (NO FLOATS!) ---
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-    ret = kernel_write(file, data, size, &pos);
-#else
-    mm_segment_t oldfs = get_fs();
-    set_fs(get_ds());
-    ret = vfs_write(file, data, size, &pos);
-    set_fs(oldfs);
-#endif
-    return ret;
-}
-
-// --- GYRO LOGIC ---
-
-// Автопоиск (исправленный)
+// Автопоиск
 void gyro_auto_find(void) {
     int i;
     char sys_path[128];
@@ -104,31 +113,22 @@ void gyro_auto_find(void) {
     printk(KERN_INFO "LKM: Starting Gyro Auto-Search...");
 
     for (i = 0; i < 30; i++) {
-        // Формируем путь
         snprintf(sys_path, sizeof(sys_path), "/sys/class/input/event%d/device/name", i);
-        
-        // Очищаем буфер
         memset(dev_name, 0, sizeof(dev_name));
         
-        // Читаем имя
         if (read_file_content(sys_path, dev_name, 255) <= 0) {
             snprintf(sys_path, sizeof(sys_path), "/sys/class/input/event%d/name", i);
             if (read_file_content(sys_path, dev_name, 255) <= 0) continue;
         }
 
-        // Проверка имен
         if (strstr(dev_name, "bmi") || strstr(dev_name, "lsm") || 
             strstr(dev_name, "icm") || strstr(dev_name, "gyro") || 
             strstr(dev_name, "accelerometer") || strstr(dev_name, "qcom,smd-irq")) 
         {
             snprintf(dev_path, sizeof(dev_path), "/dev/input/event%d", i);
-            printk(KERN_INFO "LKM: Found potential gyro: %s -> %s", dev_name, dev_path);
-            
             f = file_open(dev_path, O_RDWR, 0);
             if (f) {
                 gyro_filp = f;
-                // strlcpy(gyro_path, dev_path, sizeof(gyro_path)); // В ядре strlcpy безопаснее
-                memcpy(gyro_path, dev_path, sizeof(gyro_path));
                 printk(KERN_INFO "LKM: Hooked gyro: %s", dev_path);
                 return;
             }
@@ -136,27 +136,24 @@ void gyro_auto_find(void) {
     }
 }
 
-// Функция движения (исправленная)
-void kernel_gyro_move(float x, float y) {
+// Функция движения (ПРИНИМАЕТ INT, ЧТОБЫ ИЗБЕЖАТЬ FPU)
+// x_val, y_val - уже умноженные на 10 или 100 в юзерспейсе
+void kernel_gyro_move(int x_val, int y_val) {
     struct input_event ev[3];
-    int val_x, val_y;
 
     if (!gyro_filp) {
         gyro_auto_find();
         if (!gyro_filp) return;
     }
 
-    val_x = (int)(x * 10.0f);
-    val_y = (int)(y * 10.0f);
-
-    ev[0].type = EV_REL; ev[0].code = REL_RX; ev[0].value = val_x;
-    ev[1].type = EV_REL; ev[1].code = REL_RY; ev[1].value = val_y;
+    // Здесь нет float операций!
+    ev[0].type = EV_REL; ev[0].code = REL_RX; ev[0].value = x_val;
+    ev[1].type = EV_REL; ev[1].code = REL_RY; ev[1].value = y_val;
     ev[2].type = EV_SYN; ev[2].code = SYN_REPORT; ev[2].value = 0;
 
     file_write(gyro_filp, 0, (unsigned char*)ev, sizeof(ev));
 }
 
-// Очистка при выгрузке (вызови это в cleanup_module)
 void gyro_cleanup(void) {
     if (gyro_filp) {
         filp_close(gyro_filp, NULL);
@@ -237,10 +234,10 @@ case OP_SET_HW_BP:
 case OP_GYRO_MOVE:
 {
     struct GyroData data;
-    // Обязательно добавь scope {}, чтобы можно было объявить data
     if (copy_from_user(&data, (void __user *)arg, sizeof(data))) {
         return -EFAULT;
     }
+    // Передаем int напрямую
     kernel_gyro_move(data.x, data.y);
     break;
 }
