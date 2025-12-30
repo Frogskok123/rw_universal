@@ -16,7 +16,7 @@
 #define OP_SET_HW_BP 0x807
 #define OP_DEL_HW_BP 0x808
 #define OP_GET_DEBUG_EVENT 0x809 // Получить событие (срабатывание BP)
-
+#define OP_GYRO_MOVE = 0x810 // Или любой свободный номер
 // Типы брейкпоинтов
 #define BP_TYPE_EXEC  0
 #define BP_TYPE_WRITE 1
@@ -57,5 +57,12 @@ typedef struct _DEBUG_EVENT {
     uintptr_t regs[31]; // X0-X30 для ARM64
     uintptr_t fault_addr; // Адрес, к которому был доступ (для Watchpoint)
 } DEBUG_EVENT;
+// В enum OPERATIONS добавь:
 
+
+// Добавь структуру для передачи данных:
+struct GyroData {
+    float x;
+    float y;
+};
 #endif
