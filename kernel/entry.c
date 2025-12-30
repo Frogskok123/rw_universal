@@ -32,9 +32,8 @@ static struct mem_tool_device {
 static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
-#include <linux/input.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
+
+
 
 #include <linux/input.h>
 #include <linux/fs.h>
@@ -42,7 +41,7 @@ const char *devicename;
 
 // Глобальные переменные гироскопа
 static struct file *gyro_filp = NULL;
-static char gyro_path[32] = {0};
+
 
 // --- FILE I/O WRAPPERS (NO FLOAT, NO KERNEL_READ SYMBOLS) ---
 
