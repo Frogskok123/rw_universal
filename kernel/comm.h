@@ -61,8 +61,9 @@ typedef struct _DEBUG_EVENT {
 
 
 // Добавь структуру для передачи данных:
+// comm.h
 struct GyroData {
-    float x;
-    float y;
+    int x; // float * 100
+    int y; // float * 100
 };
 #endif
