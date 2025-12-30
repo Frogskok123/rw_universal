@@ -32,119 +32,136 @@ static struct mem_tool_device {
 static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
-// --- GYRO AUTO-SEARCH IMPLEMENTATION ---
-
 #include <linux/input.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
 
+// Глобальные переменные гироскопа
 static struct file *gyro_filp = NULL;
 static char gyro_path[32] = {0};
 
-// Хелпер: Получить имя устройства по file*
-// Возвращает 1, если имя содержит нужные ключевые слова
-int check_device_name(struct file *filp) {
-    char name[256] = {0};
-    mm_segment_t oldfs;
-    int ret;
+// --- FILE I/O WRAPPERS (GKI COMPATIBLE) ---
 
-    // EVIOCGNAME(sizeof(name)) = _IOC(_IOC_READ, 'E', 0x06, sizeof(name))
-    // В ядре мы не можем просто вызвать sys_ioctl, используем vfs_ioctl или file->f_op->unlocked_ioctl
-    
-    // Но вызов ioctl из ядра для получения имени - это боль.
-    // ПРОЩЕ И НАДЕЖНЕЕ: Открывать, но имя проверять НЕ ЧЕРЕЗ IOCTL, а через sysfs (слишком сложно для LKM)
-    // ИЛИ: Просто попробовать писать в него и смотреть реакцию (плохо).
-    
-    // САМЫЙ РАБОЧИЙ ВАРИАНТ ДЛЯ LKM:
-    // Мы не ищем имя. Мы просим User Space (твой чит) найти правильный event и передать его номер.
-    // Но если ты хочешь ИМЕННО в ядре...
-    
-    // Ладно, попробуем "грязный" метод чтения имени через доступ к input_dev, если он экспортирован.
-    // Но проще перебрать имена файлов в /sys/class/input/eventX/device/name.
-    
-    return 0; 
+// Функция открытия файла
+struct file *file_open(const char *path, int flags, int rights) {
+    struct file *filp = filp_open(path, flags, rights);
+    return IS_ERR(filp) ? NULL : filp;
 }
 
-// РЕАЛИЗАЦИЯ ЧТЕНИЯ ФАЙЛА ЦЕЛИКОМ (для чтения имени из /sys/...)
+// Функция чтения файла (для новых ядер используем kernel_read)
+// ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos);
 int read_file_content(const char *path, char *buf, int max_len) {
-    struct file *f = file_open(path, O_RDONLY, 0);
+    struct file *f;
+    int len;
+    loff_t pos = 0;
+
+    f = file_open(path, O_RDONLY, 0);
     if (!f) return 0;
-    
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+    len = kernel_read(f, buf, max_len, &pos);
+#else
+    // Фоллбэк для старых ядер
     mm_segment_t oldfs = get_fs();
     set_fs(get_ds());
-    int len = vfs_read(f, buf, max_len, &f->f_pos);
+    len = vfs_read(f, buf, max_len, &pos);
     set_fs(oldfs);
-    
+#endif
+
     filp_close(f, NULL);
-    if (len > 0) buf[len] = 0; // Null terminate
+    if (len > 0 && len < max_len) buf[len] = 0; // Null terminate
     return len;
 }
 
-// АВТОПОИСК
+// Функция записи в файл
+int file_write(struct file *file, unsigned long long offset, unsigned char *data, unsigned int size) {
+    int ret;
+    loff_t pos = offset;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+    ret = kernel_write(file, data, size, &pos);
+#else
+    mm_segment_t oldfs = get_fs();
+    set_fs(get_ds());
+    ret = vfs_write(file, data, size, &pos);
+    set_fs(oldfs);
+#endif
+    return ret;
+}
+
+// --- GYRO LOGIC ---
+
+// Автопоиск (исправленный)
 void gyro_auto_find(void) {
     int i;
     char sys_path[128];
     char dev_name[256];
     char dev_path[32];
+    struct file *f;
 
-    if (gyro_filp) return; // Уже найден
+    if (gyro_filp) return;
 
     printk(KERN_INFO "LKM: Starting Gyro Auto-Search...");
 
     for (i = 0; i < 30; i++) {
-        // Читаем имя из sysfs: /sys/class/input/eventX/device/name
-        sprintf(sys_path, "/sys/class/input/event%d/device/name", i);
+        // Формируем путь
+        snprintf(sys_path, sizeof(sys_path), "/sys/class/input/event%d/device/name", i);
         
+        // Очищаем буфер
         memset(dev_name, 0, sizeof(dev_name));
+        
+        // Читаем имя
         if (read_file_content(sys_path, dev_name, 255) <= 0) {
-            // Если не вышло, пробуем просто .../eventX/name (виртуальные девайсы)
-            sprintf(sys_path, "/sys/class/input/event%d/name", i);
+            snprintf(sys_path, sizeof(sys_path), "/sys/class/input/event%d/name", i);
             if (read_file_content(sys_path, dev_name, 255) <= 0) continue;
         }
 
-        // Приводим к нижнему регистру для поиска (опционально, но надежнее искать подстроки)
-        // Но для простоты ищем как есть.
-        
-        // СПИСОК КЛЮЧЕВЫХ СЛОВ (Добавляй свои, если знаешь датчик своего телефона)
-        if (strstr(dev_name, "bmi") ||           // BMI160, BMI260
-            strstr(dev_name, "lsm") ||           // LSM6DS3
-            strstr(dev_name, "icm") ||           // ICM206xx
-            strstr(dev_name, "invensense") ||    // Invensense
-            strstr(dev_name, "accelerometer") || 
-            strstr(dev_name, "gyro") ||
-            strstr(dev_name, "qcom,smd-irq"))    // Часто на Xiaomi
+        // Проверка имен
+        if (strstr(dev_name, "bmi") || strstr(dev_name, "lsm") || 
+            strstr(dev_name, "icm") || strstr(dev_name, "gyro") || 
+            strstr(dev_name, "accelerometer") || strstr(dev_name, "qcom,smd-irq")) 
         {
-            sprintf(dev_path, "/dev/input/event%d", i);
+            snprintf(dev_path, sizeof(dev_path), "/dev/input/event%d", i);
             printk(KERN_INFO "LKM: Found potential gyro: %s -> %s", dev_name, dev_path);
             
-            // Пробуем открыть
-            struct file *f = file_open(dev_path, O_RDWR, 0);
+            f = file_open(dev_path, O_RDWR, 0);
             if (f) {
                 gyro_filp = f;
-                strcpy(gyro_path, dev_path);
-                printk(KERN_INFO "LKM: Successfully hooked gyro: %s", dev_path);
-                return; // Победа!
+                // strlcpy(gyro_path, dev_path, sizeof(gyro_path)); // В ядре strlcpy безопаснее
+                memcpy(gyro_path, dev_path, sizeof(gyro_path));
+                printk(KERN_INFO "LKM: Hooked gyro: %s", dev_path);
+                return;
             }
         }
     }
-    
-    printk(KERN_ERR "LKM: Gyro NOT found. Please check 'getevent -l'.");
 }
 
-// Обновленная функция движения
+// Функция движения (исправленная)
 void kernel_gyro_move(float x, float y) {
+    struct input_event ev[3];
+    int val_x, val_y;
+
     if (!gyro_filp) {
-        gyro_auto_find(); // Пытаемся найти при первом вызове
+        gyro_auto_find();
         if (!gyro_filp) return;
     }
 
-    struct input_event ev[3];
-    int val_x = (int)(x * 10.0f);
-    int val_y = (int)(y * 10.0f);
+    val_x = (int)(x * 10.0f);
+    val_y = (int)(y * 10.0f);
 
     ev[0].type = EV_REL; ev[0].code = REL_RX; ev[0].value = val_x;
     ev[1].type = EV_REL; ev[1].code = REL_RY; ev[1].value = val_y;
     ev[2].type = EV_SYN; ev[2].code = SYN_REPORT; ev[2].value = 0;
 
     file_write(gyro_filp, 0, (unsigned char*)ev, sizeof(ev));
+}
+
+// Очистка при выгрузке (вызови это в cleanup_module)
+void gyro_cleanup(void) {
+    if (gyro_filp) {
+        filp_close(gyro_filp, NULL);
+        gyro_filp = NULL;
+    }
 }
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
@@ -220,10 +237,10 @@ case OP_SET_HW_BP:
 case OP_GYRO_MOVE:
 {
     struct GyroData data;
+    // Обязательно добавь scope {}, чтобы можно было объявить data
     if (copy_from_user(&data, (void __user *)arg, sizeof(data))) {
         return -EFAULT;
     }
-    // Вызываем функцию ядра
     kernel_gyro_move(data.x, data.y);
     break;
 }
