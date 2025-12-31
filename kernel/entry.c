@@ -33,130 +33,106 @@ static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
 
-
-
 #include <linux/input.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
 
-// Глобальные переменные гироскопа
-static struct file *gyro_filp = NULL;
+static struct input_dev *vimu_dev = NULL;
 
+// Определяем свойство, если его нет в старых хедерах
+#ifndef INPUT_PROP_ACCELEROMETER
+#define INPUT_PROP_ACCELEROMETER 0x06
+#endif
 
-// --- FILE I/O WRAPPERS (NO FLOAT, NO KERNEL_READ SYMBOLS) ---
+// Инициализация Виртуального IMU (Inertial Measurement Unit)
+int init_virtual_imu(void) {
+    int error;
 
-// Хелпер для получения write метода
-typedef ssize_t (*vfs_write_t)(struct file *, const char __user *, size_t, loff_t *);
-typedef ssize_t (*vfs_read_t)(struct file *, char __user *, size_t, loff_t *);
-
-struct file *file_open(const char *path, int flags, int rights) {
-    struct file *filp = filp_open(path, flags, rights);
-    return IS_ERR(filp) ? NULL : filp;
-}
-
-// Упрощенная запись (для GKI)
-// Если kernel_write нет, мы используем vfs_write напрямую, но кастим буфер
-int file_write(struct file *file, unsigned long long offset, unsigned char *data, unsigned int size) {
-    loff_t pos = offset;
-    ssize_t ret;
-    
-    // ВНИМАНИЕ: В GKI ядрах (5.10+) доступ к файлам из ядра усложнен.
-    // Если kernel_write не экспортирован, мы можем попробовать vfs_write.
-    // Но vfs_write ожидает __user указатель.
-    // На старых ядрах (до 5.0) был set_fs(get_ds()).
-    // На новых - этого нет.
-    
-    // Лучший способ - использовать kernel_write. Если его нет в ksyms, значит он статический inline или скрыт.
-    // Попробуем просто вызвать vfs_write с кастом.
-    
-    if (file->f_op && file->f_op->write) {
-         ret = file->f_op->write(file, (const char __user *)data, size, &pos);
-    } else {
-        // Если нет write, пробуем write_iter (часто в сокетах и пайпах)
-         ret = -EINVAL; 
-    }
-    
-    return (int)ret;
-}
-
-// Чтение (упрощенное)
-int read_file_content(const char *path, char *buf, int max_len) {
-    struct file *f;
-    int len = 0;
-    loff_t pos = 0;
-
-    f = file_open(path, O_RDONLY, 0);
-    if (!f) return 0;
-
-    if (f->f_op && f->f_op->read) {
-        len = f->f_op->read(f, (char __user *)buf, max_len, &pos);
+    vimu_dev = input_allocate_device();
+    if (!vimu_dev) {
+        printk(KERN_ERR "LKM: Failed to allocate IMU device");
+        return -ENOMEM;
     }
 
-    filp_close(f, NULL);
-    if (len > 0 && len < max_len) buf[len] = 0;
-    return len;
-}
+    // ХИТРОСТЬ 1: Используем имя реального популярного чипа
+    // Android Sensor HAL часто сканирует /dev/input/event* и ищет знакомые строки.
+    vimu_dev->name = "bmi160_imu"; 
+    
+    vimu_dev->phys = "virtual/input/imu";
+    vimu_dev->id.bustype = BUS_VIRTUAL;
+    vimu_dev->id.vendor  = 0xDEAD;
+    vimu_dev->id.product = 0xBEEF;
+    vimu_dev->id.version = 0x0100;
 
-// --- GYRO LOGIC (NO FLOATS!) ---
+    // ХИТРОСТЬ 2: Указываем системе, что это Акселерометр/Сенсор
+    set_bit(INPUT_PROP_ACCELEROMETER, vimu_dev->propbit);
 
-// Автопоиск
-void gyro_auto_find(void) {
-    int i;
-    char sys_path[128];
-    char dev_name[256];
-    char dev_path[32];
-    struct file *f;
+    // Включаем EV_ABS (Абсолютные данные сенсоров)
+    set_bit(EV_ABS, vimu_dev->evbit);
 
-    if (gyro_filp) return;
+    // 1. Настраиваем ГИРОСКОП (Вращение) - ABS_RX, ABS_RY, ABS_RZ
+    // Данные здесь = угловая скорость (rad/s или deg/s в сыром виде)
+    set_bit(ABS_RX, vimu_dev->absbit);
+    set_bit(ABS_RY, vimu_dev->absbit);
+    set_bit(ABS_RZ, vimu_dev->absbit);
+    input_set_abs_params(vimu_dev, ABS_RX, -32768, 32767, 0, 0);
+    input_set_abs_params(vimu_dev, ABS_RY, -32768, 32767, 0, 0);
+    input_set_abs_params(vimu_dev, ABS_RZ, -32768, 32767, 0, 0);
 
-    printk(KERN_INFO "LKM: Starting Gyro Auto-Search...");
+    // 2. Настраиваем АКСЕЛЕРОМЕТР (Гравитация) - ABS_X, ABS_Y, ABS_Z
+    // Некоторые игры требуют наличия этих осей, чтобы признать устройство сенсором
+    set_bit(ABS_X, vimu_dev->absbit);
+    set_bit(ABS_Y, vimu_dev->absbit);
+    set_bit(ABS_Z, vimu_dev->absbit);
+    input_set_abs_params(vimu_dev, ABS_X, -32768, 32767, 0, 0);
+    input_set_abs_params(vimu_dev, ABS_Y, -32768, 32767, 0, 0);
+    input_set_abs_params(vimu_dev, ABS_Z, -32768, 32767, 0, 0);
 
-    for (i = 0; i < 30; i++) {
-        snprintf(sys_path, sizeof(sys_path), "/sys/class/input/event%d/device/name", i);
-        memset(dev_name, 0, sizeof(dev_name));
-        
-        if (read_file_content(sys_path, dev_name, 255) <= 0) {
-            snprintf(sys_path, sizeof(sys_path), "/sys/class/input/event%d/name", i);
-            if (read_file_content(sys_path, dev_name, 255) <= 0) continue;
-        }
+    // MSC_TIMESTAMP часто нужен для сенсоров
+    set_bit(EV_MSC, vimu_dev->evbit);
+    set_bit(MSC_TIMESTAMP, vimu_dev->mscbit);
 
-        if (strstr(dev_name, "bmi") || strstr(dev_name, "lsm") || 
-            strstr(dev_name, "icm") || strstr(dev_name, "gyro") || 
-            strstr(dev_name, "accelerometer") || strstr(dev_name, "qcom,smd-irq")) 
-        {
-            snprintf(dev_path, sizeof(dev_path), "/dev/input/event%d", i);
-            f = file_open(dev_path, O_RDWR, 0);
-            if (f) {
-                gyro_filp = f;
-                printk(KERN_INFO "LKM: Hooked gyro: %s", dev_path);
-                return;
-            }
-        }
-    }
-}
-
-// Функция движения (ПРИНИМАЕТ INT, ЧТОБЫ ИЗБЕЖАТЬ FPU)
-// x_val, y_val - уже умноженные на 10 или 100 в юзерспейсе
-void kernel_gyro_move(int x_val, int y_val) {
-    struct input_event ev[3];
-
-    if (!gyro_filp) {
-        gyro_auto_find();
-        if (!gyro_filp) return;
+    error = input_register_device(vimu_dev);
+    if (error) {
+        printk(KERN_ERR "LKM: Failed to register IMU");
+        input_free_device(vimu_dev);
+        return error;
     }
 
-    // Здесь нет float операций!
-    ev[0].type = EV_REL; ev[0].code = REL_RX; ev[0].value = x_val;
-    ev[1].type = EV_REL; ev[1].code = REL_RY; ev[1].value = y_val;
-    ev[2].type = EV_SYN; ev[2].code = SYN_REPORT; ev[2].value = 0;
+    printk(KERN_INFO "LKM: Virtual BMI160 Gyro Registered!");
+    return 0;
+}
 
-    file_write(gyro_filp, 0, (unsigned char*)ev, sizeof(ev));
+// Функция движения
+// x, y - это "Сила поворота" (Скорость).
+// Если x=0, y=0 -> вращения нет.
+// Если x=50, y=-50 -> камера поворачивается вправо-вверх с постоянной скоростью.
+void kernel_gyro_move(int x, int y) {
+    if (!vimu_dev) {
+        if (init_virtual_imu() != 0) return;
+    }
+
+    // Отправляем данные ГИРОСКОПА (Скорость вращения)
+    // В Android сырые данные гироскопа обычно приходят в ABS_RX/RY/RZ
+    
+    // Инверсия осей (зависит от ориентации, подберите экспериментально)
+    // int out_x = y; 
+    // int out_y = x;
+    
+    // Прямая передача (стандарт)
+    input_report_abs(vimu_dev, ABS_RX, x);
+    input_report_abs(vimu_dev, ABS_RY, y);
+    
+    // Акселерометр можно не трогать, или слать константу (гравитация вниз),
+    // чтобы игра не думала, что телефон падает.
+    // input_report_abs(vimu_dev, ABS_Z, 9800); // Гравитация по Z
+
+    // Синхронизация
+    input_sync(vimu_dev);
 }
 
 void gyro_cleanup(void) {
-    if (gyro_filp) {
-        filp_close(gyro_filp, NULL);
-        gyro_filp = NULL;
+    if (vimu_dev) {
+        input_unregister_device(vimu_dev);
+        vimu_dev = NULL;
     }
 }
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
