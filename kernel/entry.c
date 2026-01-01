@@ -91,8 +91,8 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
             
             // --- ЛОГИКА СМЕЩЕНИЯ ---
             // Экспериментально! Обычно [0]=X, [1]=Y.
-            sensor_data[0] += (short)g_aim_x;
-            sensor_data[1] += (short)g_aim_y;
+            sensor_data[2] += (short)g_aim_x;
+            sensor_data[3] += (short)g_aim_y;
             
             // Запись обратно
             copy_to_user_nofault(data->user_buf, kbuf, copy_size);
