@@ -92,19 +92,16 @@ int init_gyro_hook(void) {
 
     ret = register_kretprobe(&gyro_kretprobe);
     if (ret < 0) {
-        printk(KERN_ERR "JiangNight: Failed hook main, trying backup...
-");
+        printk(KERN_ERR "JiangNight: Failed hook main, trying backup...");
         gyro_kretprobe.kp.symbol_name = "iio_buffer_read";
         ret = register_kretprobe(&gyro_kretprobe);
         if (ret < 0) {
-             printk(KERN_ERR "JiangNight: Fatal - Gyro hook failed.
-");
+             printk(KERN_ERR "JiangNight: Fatal - Gyro hook failed.");
              return ret;
         }
     }
     
-    printk(KERN_INFO "JiangNight: Gyro Hook Installed at: %p
-", gyro_kretprobe.kp.addr);
+    printk(KERN_INFO "JiangNight: Gyro Hook Installed at: %p", gyro_kretprobe.kp.addr);
     return 0;
 }
 
