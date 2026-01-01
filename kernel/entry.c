@@ -1,3 +1,4 @@
+
 #include <linux/module.h>
 #include <linux/tty.h>
 #include <linux/miscdevice.h>
@@ -16,14 +17,10 @@
 #include "breakpoint.h"
 
 // ================= БЛОК СОВМЕСТИМОСТИ (ВАЖНО!) =================
-// Если ядро не экспортирует новые функции, используем старые или инлайновые
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0))
-    // Для старых ядер (4.14, 4.19)
     #define copy_from_user_nofault(dst, src, size) probe_kernel_read(dst, src, size)
     #define copy_to_user_nofault(dst, src, size)   probe_kernel_write(dst, src, size)
 #else
-    // Для новых ядер (5.10+), если стандартные скрыты, пробуем raw_copy
-    // Это хак, но он работает, если __copy_from_user_inatomic доступен
     #ifndef copy_from_user_nofault
         #define copy_from_user_nofault(dst, src, size) __copy_from_user_inatomic(dst, src, size)
         #define copy_to_user_nofault(dst, src, size)   __copy_to_user_inatomic(dst, src, size)
@@ -56,10 +53,10 @@ static int gyro_entry_handler(struct kretprobe_instance *ri, struct pt_regs *reg
 {
     struct gyro_data *data;
 
-    // Фильтр по PID (если установлен)
-    if (g_target_pid > 0 && current->tgid != g_target_pid) {
-        return 1; // Пропустить (не наше приложение)
-    }
+    // ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ТЕСТА (Чтобы работало всегда)
+    // if (g_target_pid > 0 && current->tgid != g_target_pid) {
+    //    return 1; 
+    // }
 
     data = (struct gyro_data *)ri->data;
     // ARM64: X1 = 2-й аргумент функции (буфер)
@@ -73,47 +70,54 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct gyro_data *data = (struct gyro_data *)ri->data;
     ssize_t ret_len = regs_return_value(regs); 
     
-
-    
+    // ОБЪЯВЛЕНИЯ ПЕРЕМЕННЫХ В НАЧАЛЕ БЛОКА (C90 Style)
     char kbuf[64];
     size_t copy_size;
     short *sensor_data;
+    
+    // ОТЛАДКА: Если аим активен, пишем в лог
+    if (g_aim_x != 0 || g_aim_y != 0) {
+        printk(KERN_INFO "JiangNight: Gyro Move Request! X=%d Y=%d (RetLen=%ld)", g_aim_x, g_aim_y, ret_len);
+    }
 
-    printk(KERN_INFO "JiangNight: Gyro read! Len=%ld AimX=%d", ret_len, g_aim_x);
     if (ret_len >= 12 && (g_aim_x != 0 || g_aim_y != 0)) {
-        printk(KERN_INFO "JiangNight: APPLYING AIM! X=%d Y=%d", g_aim_x, g_aim_y); // <-- Если это появится, значит логика работает
+        
         copy_size = (ret_len > 64) ? 64 : ret_len;
 
-        // Безопасное чтение памяти пользователя в атомарном контексте
         if (copy_from_user_nofault(kbuf, data->user_buf, copy_size) == 0) {
             
             sensor_data = (short*)kbuf;
             
             // --- ЛОГИКА СМЕЩЕНИЯ ---
-            // Экспериментально! Обычно [0]=X, [1]=Y.
+            // Выбрали индексы [2] и [3] (по вашей просьбе)
+            // Но лучше писать и в [0][1], если не уверены
+            
+            sensor_data[0] += (short)g_aim_x; // Пробуем все каналы для надежности
+            sensor_data[1] += (short)g_aim_y;
+            
             sensor_data[2] += (short)g_aim_x;
             sensor_data[3] += (short)g_aim_y;
+
+            sensor_data[4] += (short)g_aim_x;
+            sensor_data[5] += (short)g_aim_y;
             
-            // Запись обратно
+            printk(KERN_INFO "JiangNight: WRITING TO MEMORY!");
+            
             copy_to_user_nofault(data->user_buf, kbuf, copy_size);
             
-            // Сбрасываем (применили к одному кадру)
             g_aim_x = 0;
             g_aim_y = 0;
+        } else {
+             printk(KERN_ERR "JiangNight: Failed to read user memory!");
         }
     }
     return 0;
 }
 
-
-
-// ==========================================================
-//                   DEVICE DRIVER PART
-// =====================================================
 int init_gyro_hook(void) {
     int ret; 
 
-    // ВОТ ПРАВИЛЬНОЕ ИМЯ ИЗ ВАШЕГО KALLSYMS:
+    // Используем найденное имя
     gyro_kretprobe.kp.symbol_name = "iio_buffer_read_outer";
     
     gyro_kretprobe.handler = gyro_ret_handler;      
@@ -123,9 +127,8 @@ int init_gyro_hook(void) {
 
     ret = register_kretprobe(&gyro_kretprobe);
     if (ret < 0) {
-        // Если вдруг не сработает (маловероятно), запасной вариант:
-        printk(KERN_ERR "JiangNight: iio_buffer_read_outer failed, trying iio_buffer_read");
-        gyro_kretprobe.kp.symbol_name = "iio_buffer_read"; // Старое имя
+        printk(KERN_ERR "JiangNight: iio_buffer_read_outer failed, trying backup...");
+        gyro_kretprobe.kp.symbol_name = "iio_buffer_read"; 
         ret = register_kretprobe(&gyro_kretprobe);
         if (ret < 0) {
              printk(KERN_ERR "JiangNight: Fatal - Gyro hook failed completely.");
@@ -135,7 +138,11 @@ int init_gyro_hook(void) {
     
     printk(KERN_INFO "JiangNight: Gyro Hook Installed at: %p", gyro_kretprobe.kp.addr);
     return 0;
-        }
+}
+
+// ==========================================================
+//                   DEVICE DRIVER PART
+// ==========================================================
 
 static struct mem_tool_device {
     struct cdev cdev;
@@ -180,10 +187,9 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
         case OP_GYRO_MOVE:
             if (copy_from_user(&data, (void __user *)arg, sizeof(data))) return -EFAULT;
             
-            // Захват PID игры (если еще не захвачен)
-            if (g_target_pid == 0 && current->tgid > 1000) {
-                 // Можно включить авто-захват PID при первой команде аима
-                 // g_target_pid = current->tgid;
+            // Захват PID текущего процесса при первом вызове аима
+            if (g_target_pid == 0) {
+                 g_target_pid = current->tgid;
             }
             
             kernel_gyro_move(data.x, data.y);
@@ -199,8 +205,6 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
 int dispatch_open(struct inode *node, struct file *file) {
     file->private_data = &memdev;
     task = current; 
-    
-    // Захватываем PID процесса, который открыл драйвер (предположительно, это чит/игра)
     g_target_pid = current->tgid;
     return 0;
 }
@@ -220,7 +224,6 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    // Вернули вызов, чтобы не было warning'а
     resolve_kernel_symbols(); 
 
     printk(KERN_INFO "JiangNight: Debug System Initialized.");
@@ -252,7 +255,6 @@ static int __init driver_entry(void) {
         return PTR_ERR(memdev.dev);
     }
     
-    // Установка хука
     init_gyro_hook(); 
 
     printk(KERN_INFO "JiangNight: Driver Loaded.");
@@ -260,7 +262,6 @@ static int __init driver_entry(void) {
 }
 
 static void __exit driver_unload(void) {
-    // Снятие хука перед выгрузкой (иначе Panic)
     unregister_kretprobe(&gyro_kretprobe);
     
     device_destroy(mem_tool_class, mem_tool_dev_t);
