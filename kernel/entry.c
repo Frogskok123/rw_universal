@@ -102,11 +102,17 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     return 0;
 }
 
+
+
+// ==========================================================
+//                   DEVICE DRIVER PART
+// =====================================================
 int init_gyro_hook(void) {
     int ret; 
 
-    // Основная функция чтения буфера IIO
-    gyro_kretprobe.kp.symbol_name = "iio_buffer_read_first_n_outer";
+    // ВОТ ПРАВИЛЬНОЕ ИМЯ ИЗ ВАШЕГО KALLSYMS:
+    gyro_kretprobe.kp.symbol_name = "iio_buffer_read_outer";
+    
     gyro_kretprobe.handler = gyro_ret_handler;      
     gyro_kretprobe.entry_handler = gyro_entry_handler; 
     gyro_kretprobe.data_size = sizeof(struct gyro_data);
@@ -114,23 +120,19 @@ int init_gyro_hook(void) {
 
     ret = register_kretprobe(&gyro_kretprobe);
     if (ret < 0) {
-        printk(KERN_ERR "JiangNight: Failed hook main, trying backup...");
-        // Запасной вариант
-        gyro_kretprobe.kp.symbol_name = "iio_buffer_read";
+        // Если вдруг не сработает (маловероятно), запасной вариант:
+        printk(KERN_ERR "JiangNight: iio_buffer_read_outer failed, trying iio_buffer_read");
+        gyro_kretprobe.kp.symbol_name = "iio_buffer_read"; // Старое имя
         ret = register_kretprobe(&gyro_kretprobe);
         if (ret < 0) {
-             printk(KERN_ERR "JiangNight: Fatal - Gyro hook failed.");
+             printk(KERN_ERR "JiangNight: Fatal - Gyro hook failed completely.");
              return ret;
         }
     }
     
     printk(KERN_INFO "JiangNight: Gyro Hook Installed at: %p", gyro_kretprobe.kp.addr);
     return 0;
-}
-
-// ==========================================================
-//                   DEVICE DRIVER PART
-// ==========================================================
+        }
 
 static struct mem_tool_device {
     struct cdev cdev;
