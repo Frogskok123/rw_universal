@@ -15,6 +15,22 @@
 #include "hide_process.h"
 #include "breakpoint.h"
 
+// ================= БЛОК СОВМЕСТИМОСТИ (ВАЖНО!) =================
+// Если ядро не экспортирует новые функции, используем старые или инлайновые
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0))
+    // Для старых ядер (4.14, 4.19)
+    #define copy_from_user_nofault(dst, src, size) probe_kernel_read(dst, src, size)
+    #define copy_to_user_nofault(dst, src, size)   probe_kernel_write(dst, src, size)
+#else
+    // Для новых ядер (5.10+), если стандартные скрыты, пробуем raw_copy
+    // Это хак, но он работает, если __copy_from_user_inatomic доступен
+    #ifndef copy_from_user_nofault
+        #define copy_from_user_nofault(dst, src, size) __copy_from_user_inatomic(dst, src, size)
+        #define copy_to_user_nofault(dst, src, size)   __copy_to_user_inatomic(dst, src, size)
+    #endif
+#endif
+// ===============================================================
+
 // Глобальные переменные
 struct task_struct *task = NULL; 
 struct task_struct *hide_pid_process_task = NULL;
@@ -40,12 +56,13 @@ static int gyro_entry_handler(struct kretprobe_instance *ri, struct pt_regs *reg
 {
     struct gyro_data *data;
 
+    // Фильтр по PID (если установлен)
     if (g_target_pid > 0 && current->tgid != g_target_pid) {
-        return 1; 
+        return 1; // Пропустить (не наше приложение)
     }
 
     data = (struct gyro_data *)ri->data;
-    // ARM64: X1 = 2-й аргумент (buf)
+    // ARM64: X1 = 2-й аргумент функции (буфер)
     data->user_buf = (char __user *)regs->regs[1];
 
     return 0;
@@ -60,20 +77,24 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     size_t copy_size;
     short *sensor_data;
 
+    // Если чтение успешно (>12 байт) и есть активный аим
     if (ret_len >= 12 && (g_aim_x != 0 || g_aim_y != 0)) {
         copy_size = (ret_len > 64) ? 64 : ret_len;
 
-        // Используем copy_from_user_nofault (или probe_kernel_read для старых ядер)
+        // Безопасное чтение памяти пользователя в атомарном контексте
         if (copy_from_user_nofault(kbuf, data->user_buf, copy_size) == 0) {
             
             sensor_data = (short*)kbuf;
             
-            // Смещение (экспериментально)
+            // --- ЛОГИКА СМЕЩЕНИЯ ---
+            // Экспериментально! Обычно [0]=X, [1]=Y.
             sensor_data[0] += (short)g_aim_x;
             sensor_data[1] += (short)g_aim_y;
             
+            // Запись обратно
             copy_to_user_nofault(data->user_buf, kbuf, copy_size);
             
+            // Сбрасываем (применили к одному кадру)
             g_aim_x = 0;
             g_aim_y = 0;
         }
@@ -82,8 +103,9 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 int init_gyro_hook(void) {
-    int ret; // Объявление в начале функции!
+    int ret; 
 
+    // Основная функция чтения буфера IIO
     gyro_kretprobe.kp.symbol_name = "iio_buffer_read_first_n_outer";
     gyro_kretprobe.handler = gyro_ret_handler;      
     gyro_kretprobe.entry_handler = gyro_entry_handler; 
@@ -93,6 +115,7 @@ int init_gyro_hook(void) {
     ret = register_kretprobe(&gyro_kretprobe);
     if (ret < 0) {
         printk(KERN_ERR "JiangNight: Failed hook main, trying backup...");
+        // Запасной вариант
         gyro_kretprobe.kp.symbol_name = "iio_buffer_read";
         ret = register_kretprobe(&gyro_kretprobe);
         if (ret < 0) {
@@ -128,8 +151,7 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
     static char name[0x100] = {0};
-    // Убрали неиспользуемые переменные bp_args, p_process
-    struct GyroData data; // Объявление
+    struct GyroData data; 
     int ret = 0;
 
     switch (cmd) {
@@ -151,20 +173,17 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             break;
             
         case OP_GYRO_MOVE:
-            // Объявление data перенесено в начало switch или перед ним
             if (copy_from_user(&data, (void __user *)arg, sizeof(data))) return -EFAULT;
             
+            // Захват PID игры (если еще не захвачен)
             if (g_target_pid == 0 && current->tgid > 1000) {
-                 // Auto-detect PID logic if needed
+                 // Можно включить авто-захват PID при первой команде аима
+                 // g_target_pid = current->tgid;
             }
             
             kernel_gyro_move(data.x, data.y);
             break;
 
-        // Если вы используете остальные команды (OP_SET_HW_BP и т.д.), 
-        // верните переменные и код, который я скрыл.
-        // Я убрал их, чтобы исправить ошибку unused variable.
-        
         default:
             ret = -EINVAL;
             break;
@@ -175,6 +194,8 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
 int dispatch_open(struct inode *node, struct file *file) {
     file->private_data = &memdev;
     task = current; 
+    
+    // Захватываем PID процесса, который открыл драйвер (предположительно, это чит/игра)
     g_target_pid = current->tgid;
     return 0;
 }
@@ -194,11 +215,9 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    // Удален init_breakpoint_system() если не используется
-   //  init_breakpoint_system(); 
+    // Вернули вызов, чтобы не было warning'а
     resolve_kernel_symbols(); 
 
-    
     printk(KERN_INFO "JiangNight: Debug System Initialized.");
     devicename = "mem_driver"; 
 
@@ -228,16 +247,16 @@ static int __init driver_entry(void) {
         return PTR_ERR(memdev.dev);
     }
     
-    init_gyro_hook(); // Kprobes hook
+    // Установка хука
+    init_gyro_hook(); 
 
     printk(KERN_INFO "JiangNight: Driver Loaded.");
     return 0;
 }
 
 static void __exit driver_unload(void) {
+    // Снятие хука перед выгрузкой (иначе Panic)
     unregister_kretprobe(&gyro_kretprobe);
-    
-    // remove_all_breakpoints(); // Если используется
     
     device_destroy(mem_tool_class, mem_tool_dev_t);
     class_destroy(mem_tool_class);
