@@ -72,14 +72,14 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct gyro_data *data = (struct gyro_data *)ri->data;
     ssize_t ret_len = regs_return_value(regs); 
-    printk(KERN_INFO "JiangNight: Gyro read! Len=%ld AimX=%d", ret_len, g_aim_x);
+    
 
     
     char kbuf[64];
     size_t copy_size;
     short *sensor_data;
 
-    
+    printk(KERN_INFO "JiangNight: Gyro read! Len=%ld AimX=%d", ret_len, g_aim_x);
     if (ret_len >= 12 && (g_aim_x != 0 || g_aim_y != 0)) {
         printk(KERN_INFO "JiangNight: APPLYING AIM! X=%d Y=%d", g_aim_x, g_aim_y); // <-- Если это появится, значит логика работает
         copy_size = (ret_len > 64) ? 64 : ret_len;
