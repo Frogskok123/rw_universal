@@ -196,6 +196,8 @@ static int __init driver_entry(void) {
     
     // Удален init_breakpoint_system() если не используется
    //  init_breakpoint_system(); 
+    resolve_kernel_symbols(); 
+
     
     printk(KERN_INFO "JiangNight: Debug System Initialized.");
     devicename = "mem_driver"; 
