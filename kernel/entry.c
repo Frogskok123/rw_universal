@@ -78,19 +78,23 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     short *sensors;
     size_t bytes_to_copy;
 
-    // Проверки
     if (g_aim_x == 0 && g_aim_y == 0) return 0;
     if (ret_len < 12) return 0; 
 
     bytes_to_copy = (ret_len > 128) ? 128 : ret_len;
 
-    // Читаем (используя probe_kernel_read)
-    if (probe_read(kbuf, ctx->user_buffer, bytes_to_copy) == 0) {
+    // --- ВАЖНЫЙ ФИКС ДЛЯ GKI ---
+    // Мы находимся в атомарном контексте. copy_from_user может уснуть.
+    // Но мы используем pagefault_disable(), чтобы превратить его в неблокирующий.
+    
+    pagefault_disable(); // Запрещаем обработку page faults
+    
+    // Пытаемся читать. В новых ядрах raw_copy_from_user доступен.
+    // Если нет - используем __copy_from_user_inatomic
+    if (__copy_from_user_inatomic(kbuf, ctx->user_buffer, bytes_to_copy) == 0) {
         
         sensors = (short*)kbuf;
         
-        // Внедрение координат
-        // Пишем в [0,1] и [3,4] для надежности
         sensors[0] += (short)g_aim_x;
         sensors[1] += (short)g_aim_y;
         
@@ -99,13 +103,13 @@ static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
              sensors[4] += (short)g_aim_y;
         }
         
-        // Пишем обратно (используя probe_kernel_write)
-        probe_write(ctx->user_buffer, kbuf, bytes_to_copy);
+        __copy_to_user_inatomic(ctx->user_buffer, kbuf, bytes_to_copy);
         
-        // Сброс
         g_aim_x = 0;
         g_aim_y = 0;
     }
+    
+    pagefault_enable(); // Разрешаем page faults обратно
 
     return 0;
 }
