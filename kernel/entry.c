@@ -4,14 +4,28 @@
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
-#include <linux/input.h> // <--- ВАЖНО ДЛЯ INPUT
+#include <linux/kprobes.h> 
+#include <linux/ptrace.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 
+// Подключаем ваши заголовки (убедитесь, что файлы лежат рядом)
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 #include "hide_process.h"
 #include "breakpoint.h"
+
+// ==========================================================
+//              MACROS & COMPATIBILITY (KERNEL 4.14 - 6.x)
+// ==========================================================
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0))
+    #define probe_read(dst, src, size) copy_from_user_nofault(dst, src, size)
+    #define probe_write(dst, src, size) copy_to_user_nofault(dst, src, size)
+#else
+    #define probe_read(dst, src, size) probe_kernel_read(dst, src, size)
+    #define probe_write(dst, src, size) probe_kernel_write(dst, src, size)
+#endif
 
 // Глобальные переменные
 struct task_struct *task = NULL; 
@@ -19,72 +33,128 @@ struct task_struct *hide_pid_process_task = NULL;
 int hide_process_pid = 0;
 int hide_process_state = 0;
 
+// Переменные Аимбота
+static int g_aim_x = 0;
+static int g_aim_y = 0;
+static int g_target_pid = 0; 
+
 // ==========================================================
-//                VIRTUAL MOUSE IMPLEMENTATION
+//              GYRO HOOK IMPLEMENTATION (PARADISE STYLE)
 // ==========================================================
 
-static struct input_dev *vmouse_dev = NULL;
+// Контекст для передачи адреса буфера от входа к выходу функции
+struct gyro_context {
+    char __user *user_buffer;
+    size_t count;
+};
 
-// Инициализация виртуальной мыши
-int init_virtual_mouse(void) {
-    int error;
+static struct kretprobe gyro_kretprobe;
 
-    // Выделяем память под устройство ввода
-    vmouse_dev = input_allocate_device();
-    if (!vmouse_dev) {
-        printk(KERN_ERR "JiangNight: Failed to allocate mouse device");
-        return -ENOMEM;
+// 1. ВХОД: Запоминаем, куда игра просит положить данные
+static int gyro_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct gyro_context *ctx = (struct gyro_context *)ri->data;
+
+    // Авто-захват PID: Если мы еще не знаем PID игры, и это не системный процесс
+    if (g_target_pid == 0 && current->tgid > 1000) {
+        // Можно раскомментировать для авто-детекта:
+        // g_target_pid = current->tgid; 
     }
 
-    // Настраиваем имя и ID (притворяемся обычной USB мышью)
-    vmouse_dev->name = "Virtual Input Mouse"; 
-    vmouse_dev->phys = "virtual/input/mouse";
-    vmouse_dev->id.bustype = BUS_USB;
-    vmouse_dev->id.vendor  = 0x1234;
-    vmouse_dev->id.product = 0x5678;
-    vmouse_dev->id.version = 0x0100;
+    // Если фильтр включен, игнорируем чужие процессы
+    if (g_target_pid > 0 && current->tgid != g_target_pid) {
+        return 1; // Пропустить (не наше приложение)
+    }
 
-    // 1. Включаем поддержку ОТНОСИТЕЛЬНЫХ координат (Мышь)
-    set_bit(EV_REL, vmouse_dev->evbit);
-    set_bit(REL_X, vmouse_dev->relbit);
-    set_bit(REL_Y, vmouse_dev->relbit);
+    // ARM64 Calling Convention:
+    // X0 = struct iio_buffer *
+    // X1 = size_t count (или буфер, зависит от ядра)
+    // В iio_buffer_read_outer(file, buf, count, ppos):
+    // X1 = user_buf
+    // X2 = count
     
-    // 2. Включаем кнопки (Левая/Правая), чтобы Android признал устройство мышью
-    set_bit(EV_KEY, vmouse_dev->evbit);
-    set_bit(BTN_LEFT, vmouse_dev->keybit);
-    set_bit(BTN_RIGHT, vmouse_dev->keybit);
+    ctx->user_buffer = (char __user *)regs->regs[1]; // Аргумент 2: User Buffer
+    ctx->count = (size_t)regs->regs[2];              // Аргумент 3: Count
 
-    // Регистрируем в системе
-    error = input_register_device(vmouse_dev);
-    if (error) {
-        printk(KERN_ERR "JiangNight: Failed to register mouse device");
-        input_free_device(vmouse_dev);
-        return error;
-    }
-
-    printk(KERN_INFO "JiangNight: Virtual Mouse Registered!");
     return 0;
 }
 
-// Функция движения (вызывается из IOCTL)
-void kernel_mouse_move(int x, int y) {
-    if (!vmouse_dev) return;
-
-    // Отправляем относительное смещение
-    // REL_X - движение по горизонтали
-    // REL_Y - движение по вертикали
-    input_report_rel(vmouse_dev, REL_X, x);
-    input_report_rel(vmouse_dev, REL_Y, y);
+// 2. ВЫХОД: Функция отработала, буфер полон. Меняем данные.
+static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct gyro_context *ctx = (struct gyro_context *)ri->data;
+    ssize_t ret_len = regs_return_value(regs); 
     
-    // Синхронизация (применить изменения)
-    input_sync(vmouse_dev);
+    // Объявления в начале (C90)
+    char kbuf[128]; 
+    short *sensors;
+    size_t bytes_to_copy;
+
+    // Если аим выключен или ошибка чтения - ничего не делаем
+    if (g_aim_x == 0 && g_aim_y == 0) return 0;
+    
+    // Проверка валидности
+    if (ret_len < 12) return 0; // Меньше 12 байт не может быть гироскопом (X,Y,Z по 2 байта + timestamp)
+
+    // Защита от переполнения стека
+    bytes_to_copy = (ret_len > 128) ? 128 : ret_len;
+
+    // Читаем данные из User Space в Kernel Space
+    if (probe_read(kbuf, ctx->user_buffer, bytes_to_copy) == 0) {
+        
+        sensors = (short*)kbuf;
+        
+        // --- ВНЕДРЕНИЕ АИМА ---
+        // Стратегия "Дробовик": Пишем в обе вероятные позиции.
+        // [0],[1] - Если читается только Гироскоп
+        // [3],[4] - Если читается Акселерометр + Гироскоп
+        
+        sensors[0] += (short)g_aim_x;
+        sensors[1] += (short)g_aim_y;
+        
+        // Проверка длины, чтобы не записать за границы
+        if (bytes_to_copy >= 12) {
+             sensors[3] += (short)g_aim_x;
+             sensors[4] += (short)g_aim_y;
+        }
+        
+        // Записываем измененные данные обратно игре
+        probe_write(ctx->user_buffer, kbuf, bytes_to_copy);
+        
+        // Сбрас координат (один тик отработан)
+        g_aim_x = 0;
+        g_aim_y = 0;
+    }
+
+    return 0;
 }
 
-void cleanup_virtual_mouse(void) {
-    if (vmouse_dev) {
-        input_unregister_device(vmouse_dev); // Это также освобождает память vmouse_dev
-        vmouse_dev = NULL;
+// Инициализация хука
+int init_gyro_hook(void) {
+    int ret;
+    
+    // Основная цель: iio_buffer_read_outer
+    gyro_kretprobe.kp.symbol_name = "iio_buffer_read_outer";
+    gyro_kretprobe.handler = gyro_ret_handler;      
+    gyro_kretprobe.entry_handler = gyro_entry_handler; 
+    gyro_kretprobe.data_size = sizeof(struct gyro_context);
+    gyro_kretprobe.maxactive = 32;
+
+    ret = register_kretprobe(&gyro_kretprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "JiangNight: iio_buffer_read_outer failed (%d), trying fallback...", ret);
+        
+        // Запасная цель: iio_buffer_read
+        gyro_kretprobe.kp.symbol_name = "iio_buffer_read"; 
+        ret = register_kretprobe(&gyro_kretprobe);
+        if (ret < 0) {
+             printk(KERN_ERR "JiangNight: Fatal - All gyro hooks failed.");
+             return ret;
+        }
     }
+    
+    printk(KERN_INFO "JiangNight: Gyro Hook Installed at %s", gyro_kretprobe.kp.symbol_name);
+    return 0;
 }
 
 // ==========================================================
@@ -94,19 +164,31 @@ void cleanup_virtual_mouse(void) {
 static struct mem_tool_device {
     struct cdev cdev;
     struct device *dev;
-    int max;
 } memdev;
 
 static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
 
+// Функция для обновления координат из IOCTL
+void kernel_gyro_move(int x, int y) {
+    g_aim_x = x;
+    g_aim_y = y;
+    
+    // Если PID еще не захвачен, берем PID текущего процесса (чита)
+    // В идеале PID игры нужно передавать отдельно через ioctl,
+    // но обычно это работает, если чит инжектится или форкает процесс.
+    if (g_target_pid == 0) {
+        // g_target_pid = current->tgid; // Раскомментировать если нужно
+    }
+}
+
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
     static char name[0x100] = {0};
     
-    // Используем ту же структуру GyroData, чтобы не менять User Space
+    // Структура данных для аима
     struct GyroData {
         int x;
         int y;
@@ -132,11 +214,9 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
             
-        case OP_GYRO_MOVE: // Используем тот же код операции
+        case OP_GYRO_MOVE:
             if (copy_from_user(&data, (void __user *)arg, sizeof(data))) return -EFAULT;
-            
-            // Передаем данные в функцию мыши
-            kernel_mouse_move(data.x, data.y);
+            kernel_gyro_move(data.x, data.y);
             break;
 
         default:
@@ -166,9 +246,9 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    // resolve_kernel_symbols(); // Не нужно для мыши, это стандартный Input API
+    // resolve_kernel_symbols(); // Если используется в memory.c
 
-    printk(KERN_INFO "JiangNight: Debug System Initialized.");
+    printk(KERN_INFO "JiangNight: Driver Initializing...");
     devicename = "mem_driver"; 
 
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
@@ -197,18 +277,16 @@ static int __init driver_entry(void) {
         return PTR_ERR(memdev.dev);
     }
     
-    // Инициализация мыши
-    if (init_virtual_mouse() != 0) {
-        printk(KERN_ERR "JiangNight: Failed to init mouse!");
-        // Не выходим с ошибкой, чтобы хотя бы чтение памяти работало
-    }
+    // Установка хука
+    init_gyro_hook(); 
 
-    printk(KERN_INFO "JiangNight: Driver Loaded.");
+    printk(KERN_INFO "JiangNight: Driver Loaded Successfully.");
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    cleanup_virtual_mouse();
+    // Снимаем хук ПЕРЕД удалением устройства
+    unregister_kretprobe(&gyro_kretprobe);
     
     device_destroy(mem_tool_class, mem_tool_dev_t);
     class_destroy(mem_tool_class);
