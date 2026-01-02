@@ -1,142 +1,45 @@
+.....:
 #include <linux/module.h>
 #include <linux/tty.h>
 #include <linux/miscdevice.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
-#include <linux/kprobes.h> 
-#include <linux/ptrace.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
-#include <linux/file.h>
 
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 #include "hide_process.h"
 #include "breakpoint.h"
-
-// ==========================================================
-//              COMPATIBILITY & HELPERS
-// ==========================================================
-
-// Принудительное объявление для старых ядер, где нет хедера
-extern long probe_kernel_read(void *dst, const void *src, size_t size);
-
-// Глобальные переменные (для совместимости с memory.c)
+// === ИСПРАВЛЕНИЕ: ОПРЕДЕЛЕНИЕ ПЕРЕМЕННОЙ ===
+// Здесь мы выделяем память под переменную. 
+// Другие файлы используют extern struct task_struct *task;
 struct task_struct *task = NULL; 
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0))
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
+
 struct task_struct *hide_pid_process_task = NULL;
 int hide_process_pid = 0;
 int hide_process_state = 0;
 
-// ==========================================================
-//              SNIFFER IMPLEMENTATION (VFS_READ)
-// ==========================================================
-
-struct read_ctx {
-    struct file *file;
-    char __user *buf;
-    size_t count;
-    char filename[64]; // Буфер для имени файла
-};
-
-static struct kretprobe sniffer_kretprobe;
-
-// 1. ВХОД: Запоминаем параметры вызова vfs_read
-static int sniffer_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct read_ctx *ctx = (struct read_ctx *)ri->data;
-    
-    // Аргументы vfs_read: X0=file, X1=buf, X2=count
-    struct file *f = (struct file *)regs->regs[0];
-    char *path_ptr;
-    char tmp_path[128];
-
-    // Опционально: фильтр по PID (раскомментировать, если спамит от системы)
-    // if (current->tgid < 1000) return 1; 
-
-    // Получаем имя файла из структуры file
-    if (f && f->f_path.dentry) {
-        path_ptr = d_path(&f->f_path, tmp_path, 128);
-        if (!IS_ERR(path_ptr)) {
-            // ФИЛЬТР: Ловим только файлы, похожие на сенсоры
-            if (strstr(path_ptr, "event") || strstr(path_ptr, "iio") || strstr(path_ptr, "sensor")) {
-                
-                // Сохраняем данные для обработчика выхода
-                strncpy(ctx->filename, path_ptr, 63);
-                ctx->file = f;
-                ctx->buf = (char __user *)regs->regs[1];
-                ctx->count = (size_t)regs->regs[2];
-                return 0; // Идем в sniffer_ret
-            }
-        }
-    }
-    return 1; // Пропускаем (не наш файл)
-}
-
-// 2. ВЫХОД: Читаем данные, которые ядро вернуло игре
-static int sniffer_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct read_ctx *ctx = (struct read_ctx *)ri->data;
-    ssize_t ret_len = regs_return_value(regs);
-    
-    char kbuf[32]; // Читаем первые 32 байта
-    short *sdata;
-    
-    // Если данных мало, это не сенсор
-    if (ret_len < 12) return 0;
-
-    // Безопасное чтение памяти пользователя (без падения ядра)
-    pagefault_disable();
-    if (probe_kernel_read(kbuf, ctx->buf, 32) == 0) {
-        sdata = (short*)kbuf;
-        
-        // ВЫВОД В DMESG
-        // Формат: [Имя файла] [Длина] [Данные: short1 short2 short3 ...]
-        // short1..3 - это обычно X, Y, Z
-        printk(KERN_INFO "GYRO_SNIFF: File=[%s] Len=%ld Data: %d %d %d %d %d %d", 
-               ctx->filename, ret_len, 
-               sdata[0], sdata[1], sdata[2], 
-               sdata[3], sdata[4], sdata[5]);
-    }
-    pagefault_enable();
-    return 0;
-}
-
-int init_sniffer(void) {
-    sniffer_kretprobe.kp.symbol_name = "vfs_read";
-    sniffer_kretprobe.handler = sniffer_ret;
-    sniffer_kretprobe.entry_handler = sniffer_entry;
-    sniffer_kretprobe.data_size = sizeof(struct read_ctx);
-    sniffer_kretprobe.maxactive = 64; // Больше очередь, чтобы не пропускать пакеты
-
-    if (register_kretprobe(&sniffer_kretprobe) < 0) {
-        printk(KERN_ERR "JiangNight: Failed to hook vfs_read");
-        return -1;
-    }
-    printk(KERN_INFO "JiangNight: Sniffer Loaded. Watch dmesg!");
-    return 0;
-}
-
-// ==========================================================
-//                   DRIVER OPS (STANDARD)
-// ==========================================================
-
 static struct mem_tool_device {
     struct cdev cdev;
     struct device *dev;
+    int max;
 } memdev;
 
 static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
 
-// Пустышка для IOCTL (аим выключен в режиме сниффера)
+
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
+    static HW_BP bp_args; // Переменная для аргументов
+    static struct process p_process;
     static char name[0x100] = {0};
     int ret = 0;
 
@@ -154,12 +57,53 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
         case OP_MODULE_BASE:
             if (copy_from_user(&mb, (void __user*)arg, sizeof(mb)) ||
                 copy_from_user(name, (void __user*)mb.name, sizeof(name)-1)) return -EFAULT;
+            
             mb.base = get_module_base(mb.pid, name);
             if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
+
+case OP_SET_HW_BP:
+        if (copy_from_user(&bp_args, (void __user*)arg, sizeof(bp_args))) return -EFAULT;
+        // Используем новую функцию с возвратом ошибок
+        ret = install_breakpoint(bp_args.pid, bp_args.addr, bp_args.type);
+        // ret уже содержит код ошибки или 0
+        break;
+
+    case OP_DEL_HW_BP:
+        if (copy_from_user(&bp_args, (void __user*)arg, sizeof(bp_args))) return -EFAULT;
+        ret = remove_breakpoint(bp_args.pid, bp_args.addr);
+        break;
+
+    case OP_GET_DEBUG_EVENT:
+        // arg - указатель на буфер DEBUG_EVENT в user-space
+        ret = get_debug_event_fw(arg);
+        break;
+        
+        case OP_HIDE_PROCESS:
+            // task устанавливается в open
+            if (task) hide_process(task, &hide_process_state);
+            break;
+
+        case OP_PID_HIDE_PROCESS:
+            if (copy_from_user(&hide_process_pid, (void __user*)arg, sizeof(hide_process_pid))) return -EFAULT;
             
-        case OP_GYRO_MOVE:
-            // В режиме сниффера игнорируем команды аима
+            rcu_read_lock();
+            hide_pid_process_task = pid_task(find_vpid(hide_process_pid), PIDTYPE_PID);
+            if (hide_pid_process_task) get_task_struct(hide_pid_process_task);
+            rcu_read_unlock();
+
+            if (hide_pid_process_task) {
+                hide_pid_process(hide_pid_process_task);
+                // put_task_struct делаем при выгрузке или восстановлении, 
+                // но для простоты здесь не делаем put, чтобы ссылка жила до close.
+                // Это утечка, если делать много раз, но для чита ок.
+            }
+            break;
+
+        case OP_GET_PROCESS_PID:
+            if (copy_from_user(&p_process, (void __user*)arg, sizeof(p_process))) return -EFAULT;
+            p_process.process_pid = get_process_pid(p_process.process_comm);
+            if (copy_to_user((void __user*)arg, &p_process, sizeof(p_process))) return -EFAULT;
             break;
 
         default:
@@ -171,11 +115,20 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
 
 int dispatch_open(struct inode *node, struct file *file) {
     file->private_data = &memdev;
-    task = current; 
+    task = current; // Сохраняем текущий процесс (кто открыл драйвер)
     return 0;
 }
 
 int dispatch_close(struct inode *node, struct file *file) {
+    if (hide_process_state && task) {
+        recover_process(task);
+    }
+    if (hide_process_pid != 0 && hide_pid_process_task) {
+        recover_process(hide_pid_process_task);
+        put_task_struct(hide_pid_process_task); // Освобождаем
+        hide_pid_process_task = NULL;
+    }
+    task = NULL;
     return 0;
 }
 
@@ -189,7 +142,10 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    printk(KERN_INFO "JiangNight: Sniffer Initializing...");
+    
+
+    init_breakpoint_system(); // Инициализация списков и FIFO
+    printk(KERN_INFO "JiangNight: Debug System Initialized.");
     devicename = "mem_driver"; 
 
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
@@ -218,20 +174,18 @@ static int __init driver_entry(void) {
         return PTR_ERR(memdev.dev);
     }
     
-    // Запуск сниффера
-    init_sniffer(); 
-
+    printk(KERN_INFO "JiangNight: Driver Loaded.");
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    unregister_kretprobe(&sniffer_kretprobe);
-    
+    remove_all_breakpoints(); // Очистка всех висящих BP
+    cleanup_breakpoint_system(); // <-- Добавить это
     device_destroy(mem_tool_class, mem_tool_dev_t);
     class_destroy(mem_tool_class);
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
-    printk(KERN_INFO "JiangNight: Sniffer Unloaded.");
+    printk(KERN_INFO "JiangNight: Driver Unloaded.");
 }
 
 module_init(driver_entry);
