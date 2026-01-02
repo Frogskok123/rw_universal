@@ -8,6 +8,9 @@
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/file.h>
 
 #include "comm.h"
 #include "memory.h"
@@ -16,129 +19,109 @@
 #include "breakpoint.h"
 
 // ==========================================================
-//              ИСПРАВЛЕНИЕ СИМВОЛОВ (SYMBOL FIX)
-// ==========================================================
-// Ошибка "Unknown symbol copy_from_user_nofault" означает, 
-// что ваше ядро (скорее всего 4.14 или 4.19) использует старые имена.
-// Мы принудительно используем probe_kernel_read/write.
-
-#define probe_read(dst, src, size) probe_kernel_read(dst, src, size)
-#define probe_write(dst, src, size) probe_kernel_write(dst, src, size)
-
+//              COMPATIBILITY & HELPERS
 // ==========================================================
 
-// Глобальные переменные
+// Принудительное объявление для старых ядер, где нет хедера
+extern long probe_kernel_read(void *dst, const void *src, size_t size);
+
+// Глобальные переменные (для совместимости с memory.c)
 struct task_struct *task = NULL; 
 struct task_struct *hide_pid_process_task = NULL;
 int hide_process_pid = 0;
 int hide_process_state = 0;
 
-// Аимбот
-static int g_aim_x = 0;
-static int g_aim_y = 0;
-static int g_target_pid = 0; 
-
 // ==========================================================
-//              GYRO HOOK (PARADISE METHOD)
+//              SNIFFER IMPLEMENTATION (VFS_READ)
 // ==========================================================
 
-struct gyro_context {
-    char __user *user_buffer;
+struct read_ctx {
+    struct file *file;
+    char __user *buf;
     size_t count;
+    char filename[64]; // Буфер для имени файла
 };
 
-static struct kretprobe gyro_kretprobe;
+static struct kretprobe sniffer_kretprobe;
 
-// 1. ENTRY HANDLER: Запоминаем адрес буфера
-static int gyro_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+// 1. ВХОД: Запоминаем параметры вызова vfs_read
+static int sniffer_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct gyro_context *ctx = (struct gyro_context *)ri->data;
-
-    if (g_target_pid > 0 && current->tgid != g_target_pid) {
-        return 1; // Пропуск чужих процессов
-    }
-
-    // В iio_buffer_read_outer(file, buf, count, ...)
-    // X1 = buf (User Space Pointer)
-    // X2 = count
+    struct read_ctx *ctx = (struct read_ctx *)ri->data;
     
-    ctx->user_buffer = (char __user *)regs->regs[1];
-    ctx->count = (size_t)regs->regs[2];
+    // Аргументы vfs_read: X0=file, X1=buf, X2=count
+    struct file *f = (struct file *)regs->regs[0];
+    char *path_ptr;
+    char tmp_path[128];
 
+    // Опционально: фильтр по PID (раскомментировать, если спамит от системы)
+    // if (current->tgid < 1000) return 1; 
+
+    // Получаем имя файла из структуры file
+    if (f && f->f_path.dentry) {
+        path_ptr = d_path(&f->f_path, tmp_path, 128);
+        if (!IS_ERR(path_ptr)) {
+            // ФИЛЬТР: Ловим только файлы, похожие на сенсоры
+            if (strstr(path_ptr, "event") || strstr(path_ptr, "iio") || strstr(path_ptr, "sensor")) {
+                
+                // Сохраняем данные для обработчика выхода
+                strncpy(ctx->filename, path_ptr, 63);
+                ctx->file = f;
+                ctx->buf = (char __user *)regs->regs[1];
+                ctx->count = (size_t)regs->regs[2];
+                return 0; // Идем в sniffer_ret
+            }
+        }
+    }
+    return 1; // Пропускаем (не наш файл)
+}
+
+// 2. ВЫХОД: Читаем данные, которые ядро вернуло игре
+static int sniffer_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct read_ctx *ctx = (struct read_ctx *)ri->data;
+    ssize_t ret_len = regs_return_value(regs);
+    
+    char kbuf[32]; // Читаем первые 32 байта
+    short *sdata;
+    
+    // Если данных мало, это не сенсор
+    if (ret_len < 12) return 0;
+
+    // Безопасное чтение памяти пользователя (без падения ядра)
+    pagefault_disable();
+    if (probe_kernel_read(kbuf, ctx->buf, 32) == 0) {
+        sdata = (short*)kbuf;
+        
+        // ВЫВОД В DMESG
+        // Формат: [Имя файла] [Длина] [Данные: short1 short2 short3 ...]
+        // short1..3 - это обычно X, Y, Z
+        printk(KERN_INFO "GYRO_SNIFF: File=[%s] Len=%ld Data: %d %d %d %d %d %d", 
+               ctx->filename, ret_len, 
+               sdata[0], sdata[1], sdata[2], 
+               sdata[3], sdata[4], sdata[5]);
+    }
+    pagefault_enable();
     return 0;
 }
 
-// 2. RET HANDLER: Модифицируем данные
-static int gyro_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct gyro_context *ctx = (struct gyro_context *)ri->data;
-    ssize_t ret_len = regs_return_value(regs); 
-    
-    char kbuf[128]; 
-    short *sensors;
-    size_t bytes_to_copy;
+int init_sniffer(void) {
+    sniffer_kretprobe.kp.symbol_name = "vfs_read";
+    sniffer_kretprobe.handler = sniffer_ret;
+    sniffer_kretprobe.entry_handler = sniffer_entry;
+    sniffer_kretprobe.data_size = sizeof(struct read_ctx);
+    sniffer_kretprobe.maxactive = 64; // Больше очередь, чтобы не пропускать пакеты
 
-    if (g_aim_x == 0 && g_aim_y == 0) return 0;
-    if (ret_len < 12) return 0; 
-
-    bytes_to_copy = (ret_len > 128) ? 128 : ret_len;
-
-    // --- ВАЖНЫЙ ФИКС ДЛЯ GKI ---
-    // Мы находимся в атомарном контексте. copy_from_user может уснуть.
-    // Но мы используем pagefault_disable(), чтобы превратить его в неблокирующий.
-    
-    pagefault_disable(); // Запрещаем обработку page faults
-    
-    // Пытаемся читать. В новых ядрах raw_copy_from_user доступен.
-    // Если нет - используем __copy_from_user_inatomic
-    if (__copy_from_user_inatomic(kbuf, ctx->user_buffer, bytes_to_copy) == 0) {
-        
-        sensors = (short*)kbuf;
-        
-        sensors[0] += (short)g_aim_x;
-        sensors[1] += (short)g_aim_y;
-        
-        if (bytes_to_copy >= 12) {
-             sensors[3] += (short)g_aim_x;
-             sensors[4] += (short)g_aim_y;
-        }
-        
-        __copy_to_user_inatomic(ctx->user_buffer, kbuf, bytes_to_copy);
-        
-        g_aim_x = 0;
-        g_aim_y = 0;
+    if (register_kretprobe(&sniffer_kretprobe) < 0) {
+        printk(KERN_ERR "JiangNight: Failed to hook vfs_read");
+        return -1;
     }
-    
-    pagefault_enable(); // Разрешаем page faults обратно
-
-    return 0;
-}
-
-int init_gyro_hook(void) {
-    int ret;
-    
-    gyro_kretprobe.kp.symbol_name = "iio_buffer_read_outer";
-    gyro_kretprobe.handler = gyro_ret_handler;      
-    gyro_kretprobe.entry_handler = gyro_entry_handler; 
-    gyro_kretprobe.data_size = sizeof(struct gyro_context);
-    gyro_kretprobe.maxactive = 32;
-
-    ret = register_kretprobe(&gyro_kretprobe);
-    if (ret < 0) {
-        printk(KERN_ERR "JiangNight: iio_buffer_read_outer failed, trying fallback...");
-        gyro_kretprobe.kp.symbol_name = "iio_buffer_read"; 
-        ret = register_kretprobe(&gyro_kretprobe);
-        if (ret < 0) {
-             printk(KERN_ERR "JiangNight: All gyro hooks failed.");
-             return ret;
-        }
-    }
-    printk(KERN_INFO "JiangNight: Gyro Hook Installed.");
+    printk(KERN_INFO "JiangNight: Sniffer Loaded. Watch dmesg!");
     return 0;
 }
 
 // ==========================================================
-//                   DRIVER OPS
+//                   DRIVER OPS (STANDARD)
 // ==========================================================
 
 static struct mem_tool_device {
@@ -150,24 +133,11 @@ static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
 
-void kernel_gyro_move(int x, int y) {
-    g_aim_x = x;
-    g_aim_y = y;
-    if (g_target_pid == 0) {
-        // g_target_pid = current->tgid; // Опционально: автозахват PID
-    }
-}
-
+// Пустышка для IOCTL (аим выключен в режиме сниффера)
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
     static char name[0x100] = {0};
-    
-    struct GyroData {
-        int x;
-        int y;
-    } data;
-    
     int ret = 0;
 
     switch (cmd) {
@@ -189,8 +159,7 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             break;
             
         case OP_GYRO_MOVE:
-            if (copy_from_user(&data, (void __user *)arg, sizeof(data))) return -EFAULT;
-            kernel_gyro_move(data.x, data.y);
+            // В режиме сниффера игнорируем команды аима
             break;
 
         default:
@@ -220,7 +189,7 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    printk(KERN_INFO "JiangNight: Initializing...");
+    printk(KERN_INFO "JiangNight: Sniffer Initializing...");
     devicename = "mem_driver"; 
 
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
@@ -249,21 +218,20 @@ static int __init driver_entry(void) {
         return PTR_ERR(memdev.dev);
     }
     
-    // Инициализация хука
-    init_gyro_hook(); 
+    // Запуск сниффера
+    init_sniffer(); 
 
-    printk(KERN_INFO "JiangNight: Driver Loaded.");
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    unregister_kretprobe(&gyro_kretprobe);
+    unregister_kretprobe(&sniffer_kretprobe);
     
     device_destroy(mem_tool_class, mem_tool_dev_t);
     class_destroy(mem_tool_class);
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
-    printk(KERN_INFO "JiangNight: Driver Unloaded.");
+    printk(KERN_INFO "JiangNight: Sniffer Unloaded.");
 }
 
 module_init(driver_entry);
