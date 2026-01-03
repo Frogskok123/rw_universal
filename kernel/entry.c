@@ -25,15 +25,6 @@ struct task_struct *hide_pid_process_task = NULL;
 int hide_process_pid = 0;
 int hide_process_state = 0;
 
-static struct mem_tool_device {
-    struct cdev cdev;
-    struct device *dev;
-    int max;
-} memdev;
-
-static dev_t mem_tool_dev_t;
-static struct class *mem_tool_class;
-const char *devicename;
 
 
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
