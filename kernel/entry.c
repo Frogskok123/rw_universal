@@ -105,24 +105,7 @@ case OP_SET_HW_BP:
     return ret;
 }
 
-int dispatch_open(struct inode *node, struct file *file) {
-    file->private_data = &memdev;
-    task = current; // Сохраняем текущий процесс (кто открыл драйвер)
-    return 0;
-}
 
-int dispatch_close(struct inode *node, struct file *file) {
-    if (hide_process_state && task) {
-        recover_process(task);
-    }
-    if (hide_process_pid != 0 && hide_pid_process_task) {
-        recover_process(hide_pid_process_task);
-        put_task_struct(hide_pid_process_task); // Освобождаем
-        hide_pid_process_task = NULL;
-    }
-    task = NULL;
-    return 0;
-}
 
 struct file_operations dispatch_functions = {
     .owner = THIS_MODULE,
