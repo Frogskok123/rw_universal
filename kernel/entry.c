@@ -143,54 +143,46 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    init_breakpoint_system();  // FIFO и списки BP
+    init_breakpoint_system();
     
-    // ========================================
-    // STEALTH CHRDEV (без sysfs/class/device)
-    // ========================================
-    ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, "");  // Пустое имя
-    if (ret < 0) {
-        printk(KERN_ERR "alloc_chrdev_region failed: %d", ret);
-        return ret;
-    }
+    // Stealth chrdev
+    ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, "");
+    if (ret < 0) return ret;
     
     cdev_init(&memdev.cdev, &dispatch_functions);
     memdev.cdev.owner = THIS_MODULE;
     ret = cdev_add(&memdev.cdev, mem_tool_dev_t, 1);
     if (ret < 0) {
         unregister_chrdev_region(mem_tool_dev_t, 1);
-        printk(KERN_ERR "cdev_add failed: %d", ret);
         return ret;
     }
     
     // ========================================
-    // ДК ПЛНОЕ СОКРЫТИЕ МОДУЛЯ
+    // SAFE DKOM HIDE (GKI 5.10+)
     // ========================================
-    list_del_init(&THIS_MODULE->list);           // /proc/modules
+    list_del_init(&THIS_MODULE->list);
     list_del_init(&THIS_MODULE->source_list);
-    if (THIS_MODULE->mkobj.kobj) {
-        kobject_del(&THIS_MODULE->mkobj.kobj);
-        kobject_put(&THIS_MODULE->mkobj.kobj);
-    }
-    memset(THIS_MODULE->name, 0, MODULE_NAME_LEN);  // Пустое имя
     
-    pr_debug("Stealth driver ready. Major=%d", MAJOR(mem_tool_dev_t));
+    // Sysfs hide (безопасно)
+    kobject_del(&THIS_MODULE->mkobj.kobj);
+    
+    // Имя пустое
+    memset(THIS_MODULE->name, 0, MODULE_NAME_LEN);
+    
+    pr_debug("Stealth ready. Major=%d", MAJOR(mem_tool_dev_t));
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    // Recover модуля (безопасный rmmod)
-    list_add_tail_rcu(&THIS_MODULE->list, modules->list.prev);
-    if (THIS_MODULE->mkobj.kobj) {
-        kobject_add(&THIS_MODULE->mkobj.kobj, NULL, "module");
-    }
+    // SAFE recover
+    list_add_tail_rcu(&THIS_MODULE->list, THIS_MODULE->list.prev);
     
     remove_all_breakpoints();
     cleanup_breakpoint_system();
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
     
-    pr_debug("Stealth driver unloaded");
+    pr_debug("Stealth unloaded");
 }
 
 module_init(driver_entry);
