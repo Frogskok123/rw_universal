@@ -5,7 +5,8 @@
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
-
+#include <linux/list.h>
+#include <linux/kobject.h>
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
@@ -142,50 +143,54 @@ struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
+    init_breakpoint_system();  // FIFO и списки BP
     
-
-    init_breakpoint_system(); // Инициализация списков и FIFO
-    printk(KERN_INFO "JiangNight: Debug System Initialized.");
-    devicename = "mem_driver"; 
-
-    ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, devicename);
-    if (ret < 0) return ret;
-
+    // ========================================
+    // STEALTH CHRDEV (без sysfs/class/device)
+    // ========================================
+    ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, "");  // Пустое имя
+    if (ret < 0) {
+        printk(KERN_ERR "alloc_chrdev_region failed: %d", ret);
+        return ret;
+    }
+    
     cdev_init(&memdev.cdev, &dispatch_functions);
     memdev.cdev.owner = THIS_MODULE;
     ret = cdev_add(&memdev.cdev, mem_tool_dev_t, 1);
-    if (ret) {
+    if (ret < 0) {
         unregister_chrdev_region(mem_tool_dev_t, 1);
+        printk(KERN_ERR "cdev_add failed: %d", ret);
         return ret;
     }
-
-    mem_tool_class = class_create(THIS_MODULE, devicename);
-    if (IS_ERR(mem_tool_class)) {
-        cdev_del(&memdev.cdev);
-        unregister_chrdev_region(mem_tool_dev_t, 1);
-        return PTR_ERR(mem_tool_class);
-    }
-
-    memdev.dev = device_create(mem_tool_class, NULL, mem_tool_dev_t, NULL, devicename);
-    if (IS_ERR(memdev.dev)) {
-        class_destroy(mem_tool_class);
-        cdev_del(&memdev.cdev);
-        unregister_chrdev_region(mem_tool_dev_t, 1);
-        return PTR_ERR(memdev.dev);
-    }
     
-    printk(KERN_INFO "JiangNight: Driver Loaded.");
+    // ========================================
+    // ДК ПЛНОЕ СОКРЫТИЕ МОДУЛЯ
+    // ========================================
+    list_del_init(&THIS_MODULE->list);           // /proc/modules
+    list_del_init(&THIS_MODULE->source_list);
+    if (THIS_MODULE->mkobj.kobj) {
+        kobject_del(&THIS_MODULE->mkobj.kobj);
+        kobject_put(&THIS_MODULE->mkobj.kobj);
+    }
+    memset(THIS_MODULE->name, 0, MODULE_NAME_LEN);  // Пустое имя
+    
+    pr_debug("Stealth driver ready. Major=%d", MAJOR(mem_tool_dev_t));
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    remove_all_breakpoints(); // Очистка всех висящих BP
-    cleanup_breakpoint_system(); // <-- Добавить это
-    device_destroy(mem_tool_class, mem_tool_dev_t);
-    class_destroy(mem_tool_class);
+    // Recover модуля (безопасный rmmod)
+    list_add_tail_rcu(&THIS_MODULE->list, modules->list.prev);
+    if (THIS_MODULE->mkobj.kobj) {
+        kobject_add(&THIS_MODULE->mkobj.kobj, NULL, "module");
+    }
+    
+    remove_all_breakpoints();
+    cleanup_breakpoint_system();
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
-    printk(KERN_INFO "JiangNight: Driver Unloaded.");
+    
+    pr_debug("Stealth driver unloaded");
 }
 
 module_init(driver_entry);
