@@ -69,7 +69,7 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
         case OP_MODULE_BASE:
             if (copy_from_user(&mb, (void __user*)arg, sizeof(mb))) return -EFAULT;
             if (copy_from_user(name_buf, (void __user*)mb.name, sizeof(name_buf)-1)) return -EFAULT;
-            name_buf[sizeof(name_buf)-1] = '';
+            name_buf[sizeof(name_buf)-1] = '\0';
             mb.base = get_module_base(mb.pid, name_buf);
             if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
