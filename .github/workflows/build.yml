@@ -46,89 +46,87 @@ jobs:
             use_ndk: true
 
     steps:
-    - name: Checkout driver source
-      uses: actions/checkout@v4
-      with:
-        path: driver-src
+      - name: Checkout driver source
+        uses: actions/checkout@v4
+        with:
+          path: driver-src
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev \
-                                python3 python3-pip git wget lld llvm \
-                                libelf-dev gcc-aarch64-linux-gnu
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev \
+                                  python3 python3-pip git wget lld llvm \
+                                  libelf-dev gcc-aarch64-linux-gnu
 
-    - name: Setup Android NDK (Clang only)
-      if: matrix.use_ndk
-      run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
-        mv android-ndk-r25c android-ndk
-        echo "$GITHUB_WORKSPACE/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+      - name: Setup Android NDK (Clang only)
+        if: matrix.use_ndk
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          unzip -q android-ndk-r25c-linux.zip
+          mv android-ndk-r25c android-ndk
+          echo "$GITHUB_WORKSPACE/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone Kernel Source
-      run: |
-        git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
+      - name: Clone Kernel Source
+        run: |
+          git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
 
-    - name: Integrate Driver
-      run: |
-        cd kernel-source
-        mkdir -p drivers/khack
-        cp -r $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
-        
-        echo 'config KERNEL_HACK' > drivers/khack/Kconfig
-        echo '    tristate "JiangNight Memory Hack"' >> drivers/khack/Kconfig
-        echo '    default m' >> drivers/khack/Kconfig
-        
-        echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
-        echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
-        
-        if ! grep -q "drivers/khack" drivers/Kconfig; then
-           echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
-           echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
-        fi
+      - name: Integrate Driver
+        run: |
+          cd kernel-source
+          mkdir -p drivers/khack
+          cp -r $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
+          
+          echo 'config KERNEL_HACK' > drivers/khack/Kconfig
+          echo '    tristate "JiangNight Memory Hack"' >> drivers/khack/Kconfig
+          echo '    default m' >> drivers/khack/Kconfig
+          
+          echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
+          echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
+          
+          if ! grep -q "drivers/khack" drivers/Kconfig; then
+             echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
+             echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
+          fi
 
-    - name: Fix DTC Build Error (CFLAGS method)
-      # This forces GCC to allow multiple definitions of yylloc, fixing the error
-      run: |
-        cd kernel-source
-        echo "Applying DTC CFLAGS fix..."
-        # Modify scripts/dtc/Makefile to add -fcommon to host flags
-        sed -i 's/HOSTCFLAGS/HOSTCFLAGS += -fcommon
-HOSTCFLAGS/' scripts/dtc/Makefile 2>/dev/null || true
-        # Also modify the root Makefile for HOSTCFLAGS just in case
-        sed -i 's/^HOSTCFLAGSs*:=/HOSTCFLAGS := -fcommon /' Makefile
+      - name: Fix DTC Build Error (Simple method)
+        # Просто добавляем флаг -fcommon в Makefile, это самый надежный способ
+        run: |
+          cd kernel-source
+          echo "Applying DTC fix..."
+          echo "HOSTCFLAGS += -fcommon" >> scripts/dtc/Makefile
+          # Также для корня, на всякий случай
+          sed -i 's/^HOSTCFLAGSs*:=/HOSTCFLAGS := -fcommon /' Makefile || true
 
-    - name: Build Module
-      env:
-        ARCH: arm64
-        CROSS_COMPILE: aarch64-linux-gnu-
-        LLVM: 1
-        LLVM_IAS: 1
-      run: |
-        cd kernel-source
-        
-        echo "Configuring ${{ matrix.config }}..."
-        if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
-            make O=out ${{ matrix.config }}
-        elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
-            make O=out vendor/${{ matrix.config }}
-        else
-            make O=out defconfig
-        fi
-        
-        echo "CONFIG_KERNEL_HACK=m" >> out/.config
-        if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
-            echo "CONFIG_MODVERSIONS=n" >> out/.config
-        fi
-        
-        make O=out olddefconfig
-        make O=out -j$(nproc) modules_prepare
-        make O=out -j$(nproc) M=drivers/khack modules
+      - name: Build Module
+        env:
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          LLVM: 1
+          LLVM_IAS: 1
+        run: |
+          cd kernel-source
+          
+          echo "Configuring ${{ matrix.config }}..."
+          if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
+              make O=out ${{ matrix.config }}
+          elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
+              make O=out vendor/${{ matrix.config }}
+          else
+              make O=out defconfig
+          fi
+          
+          echo "CONFIG_KERNEL_HACK=m" >> out/.config
+          if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
+              echo "CONFIG_MODVERSIONS=n" >> out/.config
+          fi
+          
+          make O=out olddefconfig
+          make O=out -j$(nproc) modules_prepare
+          make O=out -j$(nproc) M=drivers/khack modules
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: module-${{ matrix.kernel-version }}.ko
-        path: kernel-source/out/drivers/khack/*.ko
-        if-no-files-found: error
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-${{ matrix.kernel-version }}.ko
+          path: kernel-source/out/drivers/khack/*.ko
+          if-no-files-found: error
