@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- GKI 5.10 (Legacy) ---
+          # --- GKI 5.10 (Android 12/13) ---
           - kernel-version: 5.10-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
@@ -27,6 +27,7 @@ jobs:
             branch: android14-6.1
             config: gki_defconfig
             spoof_vermagic: "true"
+            # Строка подмены (из uname -r)
             magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
 
     steps:
@@ -83,7 +84,7 @@ jobs:
         cat entry.c >> temp_entry.c
         mv temp_entry.c entry.c
 
-    - name: Build Module
+    - name: Build Module (Fast Mode)
       env:
         ARCH: arm64
         LLVM: 1
@@ -95,22 +96,31 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. Disable Checks
+        # 2. OPTIMIZATION: Disable LTO (Ускоряет сборку в 3-5 раз!)
+        ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG
+        ./scripts/config --file out/.config --disable CONFIG_LTO
+        ./scripts/config --file out/.config --enable CONFIG_LTO_NONE
+        
+        # 3. Disable Checks
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
         
-        # 3. Enable Module
+        # 4. Enable Module
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # ... внутри шага Build Module ..   
-        # 4. Build
+        # 5. Build
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
         
-         KCFLAGS="-Wno-array-bounds -Wno-error" \
-         -j$(nproc) M=drivers/khack
+        # Используем -Wno-error чтобы игнорировать баги хидеров ядра
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+             KCFLAGS="-Wno-array-bounds -Wno-error" \
+             -j$(nproc) M=drivers/khack
+        
+        # Уменьшаем размер
+        llvm-strip --strip-debug out/drivers/khack/*.ko
+
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
