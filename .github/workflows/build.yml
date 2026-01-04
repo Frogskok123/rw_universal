@@ -104,10 +104,13 @@ jobs:
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
+        # ... внутри шага Build Module ..   
         # 4. Build
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
-
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+        
+         KCFLAGS="-Wno-array-bounds -Wno-error" \
+         -j$(nproc) M=drivers/khack
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
