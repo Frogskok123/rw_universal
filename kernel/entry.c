@@ -7,12 +7,17 @@
 #include <linux/list.h>
 #include <linux/kobject.h>
 #include <linux/cdev.h>
-#include <linux/kprobes.h> // <--- ВАЖНО для фикса 6.1
+#include <linux/kprobes.h> 
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 #include "hide_process.h"
 #include "breakpoint.h"
+
+// --- FIX: Объявляем указатель здесь, чтобы компилятор его видел ---
+// (Обычно он в process.c/h, но чтобы не гадать, объявим здесь)
+void *find_task_by_vpid_ptr; 
+// ----------------------------------------------------------------
 
 // --- Глобальные переменные ---
 static struct task_struct *task_to_hide = NULL;
@@ -29,16 +34,14 @@ static struct {
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #endif
 
-// --- FIX для GKI 6.1: Динамический поиск функций ---
+// --- FIX GKI: Указатель на kallsyms ---
 unsigned long (*kallsyms_lookup_name_ptr)(const char *name);
 
-// Функция для безопасного поиска скрытых символов ядра
 static int resolve_kallsyms_via_kprobe(void) {
     struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
     int ret = register_kprobe(&kp);
     if (ret < 0) {
-        // Если не нашли kallsyms, пробуем альтернативы или падаем
-        printk(KERN_ERR "jiangnight: Failed to find kallsyms_lookup_name via kprobe");
+        printk(KERN_ERR "jiangnight: kallsyms_lookup_name search failed");
         return -1;
     }
     kallsyms_lookup_name_ptr = (void *)kp.addr;
@@ -46,9 +49,8 @@ static int resolve_kallsyms_via_kprobe(void) {
     printk(KERN_INFO "jiangnight: kallsyms found at %p", kallsyms_lookup_name_ptr);
     return 0;
 }
-// ----------------------------------------------------
+// -------------------------------------
 
-// Обработчики открытия и закрытия
 static int dispatch_open(struct inode *node, struct file *file) {
     task_to_hide = current; 
     return 0;
@@ -66,13 +68,12 @@ static int dispatch_close(struct inode *node, struct file *file) {
     return 0;
 }
 
-// Функция hijack
 int hijack_thread_with_args(THREAD_HIJACK_ARGS *ctx) {
     struct task_struct *task;
     struct pt_regs *regs;
 
-    // ВАЖНО: find_vpid и pid_task тоже могут быть скрыты, нужно искать их через kallsyms
-    // Но пока оставим так, если они есть в хедерах. Если нет - упадет при линковке.
+    // ВАЖНО: Если find_vpid не экспортирован, здесь тоже упадет.
+    // Но пока чиним только компиляцию entry.c
     task = pid_task(find_vpid(ctx->pid), PIDTYPE_PID);
     if (!task) return -ESRCH;
 
@@ -88,7 +89,6 @@ int hijack_thread_with_args(THREAD_HIJACK_ARGS *ctx) {
     return 0;
 }
 
-// IOCTL
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
@@ -111,7 +111,7 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
         case OP_MODULE_BASE:
             if (copy_from_user(&mb, (void __user*)arg, sizeof(mb))) return -EFAULT;
             if (copy_from_user(name_buf, (void __user*)mb.name, sizeof(name_buf)-1)) return -EFAULT;
-            name_buf[sizeof(name_buf)-1] = '\0';
+            name_buf[sizeof(name_buf)-1] = '';
             mb.base = get_module_base(mb.pid, name_buf);
             if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
@@ -172,24 +172,21 @@ static struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    // --- 1. ПЕРВЫМ ДЕЛОМ ИЩЕМ СИМВОЛЫ ---
-    // Без этого любой вызов системной функции убьет ядро 6.1
+    // 1. Поиск kallsyms
     if (resolve_kallsyms_via_kprobe() < 0) {
-        printk(KERN_ERR "jiangnight: Aborting load, symbols not found.");
+        printk(KERN_ERR "jiangnight: Aborting load (kallsyms not found)");
         return -EFAULT; 
     }
     
-    // Теперь можно инициализировать подсистемы, которым нужны символы
-    // (ВАЖНО: В твоем коде init_breakpoint_system ищет символы? Если да, ей нужен kallsyms_ptr)
-    
-    // Ищем указатели для соседних файлов (memory.c, process.c)
-    // Например:
+    // 2. Инициализация указателей
     find_task_by_vpid_ptr = (void *)kallsyms_lookup_name_ptr("find_task_by_vpid");
-    if (!find_task_by_vpid_ptr) printk(KERN_WARNING "jiangnight: find_task_by_vpid not found!");
-    
+    if (!find_task_by_vpid_ptr) {
+        printk(KERN_WARNING "jiangnight: find_task_by_vpid NOT FOUND! Some functions may crash.");
+    }
+
     init_breakpoint_system();
     
-    // 2. Регистрация устройства
+    // 3. Регистрация устройства
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, "");
     if (ret < 0) return ret;
     
@@ -201,27 +198,19 @@ static int __init driver_entry(void) {
         return ret;
     }
     
-    // 3. Скрытие (ВНИМАНИЕ: Включать только на релизе! Для тестов закомментируй)
-    /*
-    list_del_init(&THIS_MODULE->list);
-    list_del_init(&THIS_MODULE->source_list);
-    kobject_del(&THIS_MODULE->mkobj.kobj);
-    memset(THIS_MODULE->name, 0, MODULE_NAME_LEN);
-    */
+    // Скрытие пока отключено для тестов
+    // list_del_init(&THIS_MODULE->list);
     
-    printk(KERN_INFO "jiangnight: Driver loaded successfully. Major: %d", MAJOR(mem_tool_dev_t));
+    printk(KERN_INFO "jiangnight: Loaded. Major: %d", MAJOR(mem_tool_dev_t));
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    // Если скрывали модуль, вернуть его в список нельзя, просто удаляем ресурсы
-    // list_add_tail_rcu(&THIS_MODULE->list, THIS_MODULE->list.prev);
-    
     remove_all_breakpoints();
     cleanup_breakpoint_system();
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
-    printk(KERN_INFO "jiangnight: Driver unloaded.");
+    printk(KERN_INFO "jiangnight: Unloaded.");
 }
 
 module_init(driver_entry);
