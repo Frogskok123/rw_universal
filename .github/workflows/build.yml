@@ -17,14 +17,12 @@ jobs:
           - kernel_version: "5.10-gki"
             branch: "android12-5.10"
             ndk_version: "r25c"
-            # Для 5.10 используем старый NDK
             setup_ndk_manually: true
 
           # --- Конфигурация для 6.1 (Android 14) ---
           - kernel_version: "6.1-gki"
             branch: "android14-6.1"
             ndk_version: "r26d"
-            # Для 6.1 используем action для NDK r26 (так надежнее)
             setup_ndk_manually: false
 
     steps:
@@ -39,9 +37,8 @@ jobs:
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm libelf-dev
 
-    # --- УСТАНОВКА NDK (Разная логика для 5.10 и 6.1) ---
+    # --- УСТАНОВКА NDK ---
 
-    # Вариант 1: Для 5.10 (Старый метод)
     - name: Setup Android NDK (Manual r25c)
       if: matrix.setup_ndk_manually == true
       run: |
@@ -49,7 +46,6 @@ jobs:
         unzip -q android-ndk-r25c-linux.zip
         echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    # Вариант 2: Для 6.1 (Новый метод через Action, так как r26 сложнее скачать wget)
     - name: Setup Android NDK (Action r26d)
       if: matrix.setup_ndk_manually == false
       uses: nttld/setup-ndk@v1
@@ -69,7 +65,6 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Создаем Kconfig/Makefile (как в твоем примере)
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
             tristate "JiangNight Memory Hack Driver"
@@ -98,7 +93,7 @@ jobs:
         # 1. Базовый конфиг
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. СПЕЦИФИКА 6.1: Исправляем Exec format error (включаем ThinLTO и Modversions)
+        # 2. ФИКСЫ ДЛЯ 6.1 (ThinLTO и Modversions)
         if [[ "${{ matrix.kernel_version }}" == "6.1-gki" ]]; then
             echo "Applying 6.1 specific fixes (ThinLTO)..."
             ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
@@ -106,30 +101,20 @@ jobs:
             ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
         fi
         
-        # 3. Добавляем модуль в конфиг
+        # 3. Добавляем модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # 4. Подготовка (modules_prepare)
+        # 4. Подготовка
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 5. Сборка модуля
+        # 5. Сборка
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
         
-        # 6. Стриппинг (ИСПРАВЛЕННЫЙ МЕТОД: Без find -exec)
-        # Находим файл и сохраняем путь
-        KO_FILE=$(find out -name "jiangnight.ko" -type f | head -n 1)
-        
-        if [ -f "$KO_FILE" ]; then
-            echo "Found module at: $KO_FILE"
-            echo "Stripping debug info..."
-            llvm-strip --strip-debug "$KO_FILE"
-        else
-            echo "ERROR: Module not found!"
-            exit 1
-        fi
+        # Проверка наличия файла (без стриппинга)
+        ls -lh out/drivers/khack/*.ko
 
-    # --- ЗАГРУЗКА РЕЗУЛЬТАТА ---
+    # --- ЗАГРУЗКА ---
 
     - name: Upload module
       uses: actions/upload-artifact@v4
