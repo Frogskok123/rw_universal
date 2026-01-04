@@ -1,4 +1,4 @@
-name: Build GKI Kernel Modules (5.4, 5.10, 5.15, 6.1)
+name: Build GKI Kernel Modules (4.19, 5.4, 5.10, 5.15, 6.1)
 
 on:
   push:
@@ -13,6 +13,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Android 10/11 (Legacy Stable) - Added 4.19
+          - kernel-version: 4.19.312
+            branch: android-4.19-stable
+            config: gki_defconfig # Часто используется gki_defconfig, но если нужен perf, раскомментируй ниже
+            # config: perf_defconfig 
+
           # Android 11 (Legacy GKI)
           - kernel-version: 5.4
             branch: android11-5.4
@@ -86,6 +92,13 @@ jobs:
       run: |
         cd gki-kernel
         
+        # Специальная обработка для старых ядер (4.19), где могут быть нюансы с конфигом
+        if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
+             echo "Applying fixes for 4.19..."
+             # Иногда нужно явно отключить проверку версий модулей для хак-драйверов
+             echo "CONFIG_MODVERSIONS=n" >> out/.config
+        fi
+
         # 1. Конфигурация
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
              CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
