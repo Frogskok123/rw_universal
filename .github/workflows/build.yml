@@ -1,4 +1,4 @@
-name: Build Kernel Modules (MTK 4.19 + GKI)
+name: Build Kernel Modules (5.10 & 6.1)
 
 on:
   push:
@@ -13,119 +13,103 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- MediaTek Common Kernel (4.19) ---
-          - kernel-version: 4.19-mtk
-            repo_url: https://github.com/MediaTek-Labs/common-kernel-4.19.git
-            branch: master
-            config: defconfig
-            use_ndk: true
-
-          # --- Google GKI Kernels ---
-          - kernel-version: 5.4-gki
-            repo_url: https://android.googlesource.com/kernel/common
-            branch: android11-5.4
-            config: gki_defconfig
-            use_ndk: true
-
+          # --- GKI 5.10 (Legacy Stable) ---
           - kernel-version: 5.10-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
             config: gki_defconfig
-            use_ndk: true
+            spoof_vermagic: false  # На 5.10 обычно работает без подмены, если версия совпадает
 
-          - kernel-version: 5.15-gki
-            repo_url: https://android.googlesource.com/kernel/common
-            branch: android14-5.15
-            config: gki_defconfig
-            use_ndk: true
-
-          - kernel-version: 6.1-gki
+          # --- GKI 6.1 (Android 14/15 Dirty) ---
+          - kernel-version: 6.1-gki-dirty
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
             config: gki_defconfig
-            use_ndk: true
+            spoof_vermagic: true
+            # Строка подмены для твоего телефона (из uname -r)
+            magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
 
     steps:
-      - name: Checkout driver source
-        uses: actions/checkout@v4
-        with:
-          path: driver-src
+    - name: Checkout driver source
+      uses: actions/checkout@v4
+      with:
+        path: driver-src
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex libssl-dev \
-                                  python3 python3-pip git wget lld llvm \
-                                  libelf-dev gcc-aarch64-linux-gnu
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential bc bison flex libssl-dev \
+                                python3 python3-pip git wget lld llvm libelf-dev
 
-      - name: Setup Android NDK (Clang only)
-        if: matrix.use_ndk
-        run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-          unzip -q android-ndk-r25c-linux.zip
-          mv android-ndk-r25c android-ndk
-          echo "$GITHUB_WORKSPACE/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+    - name: Setup Android NDK
+      run: |
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Clone Kernel Source
-        run: |
-          git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
+    - name: Clone Kernel Source
+      run: |
+        git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
 
-      - name: Integrate Driver
-        run: |
-          cd kernel-source
-          mkdir -p drivers/khack
-          cp -r $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
-          
-          echo 'config KERNEL_HACK' > drivers/khack/Kconfig
-          echo '    tristate "JiangNight Memory Hack"' >> drivers/khack/Kconfig
-          echo '    default m' >> drivers/khack/Kconfig
-          
-          echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
-          echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
-          
-          if ! grep -q "drivers/khack" drivers/Kconfig; then
-             echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
-             echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
-          fi
+    - name: Integrate Driver
+      run: |
+        cd kernel-source
+        mkdir -p drivers/khack
+        cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
+        
+        # === SPOOFING LOGIC (Только для 6.1 Dirty) ===
+        if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
+            echo "Spoofing Vermagic to: ${{ matrix.magic_string }}"
+            # Вставляем макрос в начало entry.c
+            sed -i '1i #include <linux/vermagic.h>
+#undef MODULE_VERMAGIC
+#define MODULE_VERMAGIC "${{ matrix.magic_string }}"' drivers/khack/entry.c
+        fi
 
-      - name: Build Module
-        env:
-          ARCH: arm64
-          CROSS_COMPILE: aarch64-linux-gnu-
-          LLVM: 1
-          LLVM_IAS: 1
-        run: |
-          cd kernel-source
-          
-          # --- FIX: Форсируем -fcommon для хост-компилятора (GCC 10+) ---
-          export KCFLAGS="-fcommon"
-          export KCPPFLAGS="-fcommon"
-          export HOSTCFLAGS="-fcommon"
-          # -------------------------------------------------------------
-          
-          echo "Configuring ${{ matrix.config }}..."
-          if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
-              make O=out HOSTCFLAGS="-fcommon" ${{ matrix.config }}
-          elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
-              make O=out HOSTCFLAGS="-fcommon" vendor/${{ matrix.config }}
-          else
-              make O=out HOSTCFLAGS="-fcommon" defconfig
-          fi
-          
-          echo "CONFIG_KERNEL_HACK=m" >> out/.config
-          if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
-              echo "CONFIG_MODVERSIONS=n" >> out/.config
-          fi
-          
-          make O=out HOSTCFLAGS="-fcommon" olddefconfig
-          
-          # Передаем HOSTCFLAGS прямо в команду make — это приоритетнее всего
-          make O=out HOSTCFLAGS="-fcommon" -j$(nproc) modules_prepare
-          make O=out HOSTCFLAGS="-fcommon" -j$(nproc) M=drivers/khack modules
+        # Генерация Kconfig/Makefile
+        cat > drivers/khack/Kconfig <<-'EOF'
+        config KERNEL_HACK
+            tristate "Memory Hack"
+            default m
+        EOF
+        
+        cat > drivers/khack/Makefile <<-'EOF'
+        obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
+        jiangnight-objs := entry.o 
+        EOF
+        
+        echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
+        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: module-${{ matrix.kernel-version }}.ko
-          path: kernel-source/out/drivers/khack/*.ko
-          if-no-files-found: error
+    - name: Build Module
+      env:
+        ARCH: arm64
+        LLVM: 1
+        LLVM_IAS: 1
+        CROSS_COMPILE: aarch64-linux-android-
+      run: |
+        cd kernel-source
+        
+        # 1. Config
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
+        
+        # 2. Disable Checks (Критично для 6.1 Dirty)
+        ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
+        ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
+        ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
+        # Также отключаем защиту от загрузки неподписанных модулей в ядре (если возможно)
+        ./scripts/config --file out/.config --disable CONFIG_SECURITY_LOCKDOWN_LSM
+        
+        # 3. Enable Module
+        echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
+        
+        # 4. Build
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: module-${{ matrix.kernel-version }}.ko
+        path: kernel-source/out/drivers/khack/*.ko
