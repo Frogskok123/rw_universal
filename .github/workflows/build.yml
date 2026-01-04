@@ -1,4 +1,3 @@
-
 name: Build GKI Kernel Modules (5.4, 5.10, 5.15, 6.1)
 
 on:
@@ -49,38 +48,31 @@ jobs:
 
     - name: Setup Android NDK
       run: |
-        # Используем NDK r25c для 5.10+, для 5.4 может потребоваться r21, но попробуем r25
         wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
         unzip -q android-ndk-r25c-linux.zip
         echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone GKI kernel (${{ matrix.branch }})
       run: |
-        # Клонируем нужную ветку ядра
         git clone --depth 1 --branch ${{ matrix.branch }} https://android.googlesource.com/kernel/common gki-kernel
 
     - name: Integrate driver into kernel tree
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        
-        # Копируем исходники из папки kernel в репозитории
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Создаем Kconfig
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
             tristate "JiangNight Memory Hack Driver"
             default m
         EOF
         
-        # Создаем Makefile
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
         EOF
         
-        # Интегрируем в дерево
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
@@ -90,23 +82,32 @@ jobs:
         LLVM: 1
         LLVM_IAS: 1
         CROSS_COMPILE: aarch64-linux-android-
+        CLANG_TRIPLE: aarch64-linux-gnu-
       run: |
         cd gki-kernel
         
         # 1. Конфигурация
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
+             ${{ matrix.config }}
         
         # 2. Включаем модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         
-        # Обновляем конфиг (olddefconfig безопаснее silentoldconfig)
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
+        # Обновляем конфиг
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
+             olddefconfig
         
         # 3. Подготовка
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
+             -j$(nproc) modules_prepare
         
         # 4. Сборка модуля
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
+             -j$(nproc) M=drivers/khack
 
     - name: Upload module
       uses: actions/upload-artifact@v4
