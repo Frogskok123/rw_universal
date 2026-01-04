@@ -57,7 +57,7 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Используем obj-m напрямую - это самый надежный метод
+        # Принудительная сборка через obj-m
         echo 'obj-m += jiangnight.o' > drivers/khack/Makefile
         echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
 
@@ -73,7 +73,7 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. Disable LTO (Speed up)
+        # 2. Disable LTO
         ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG
         ./scripts/config --file out/.config --disable CONFIG_LTO
         ./scripts/config --file out/.config --enable CONFIG_LTO_NONE
@@ -87,9 +87,8 @@ jobs:
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 5. Build with Vermagic Fix (Safe method)
+        # 5. Build
         MY_CFLAGS="-Wno-array-bounds -Wno-error"
-        
         if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
              echo "Applying Vermagic spoof..."
              MAGIC_FLAG='-DMODULE_VERMAGIC="${{ matrix.magic_string }}"'
@@ -103,18 +102,22 @@ jobs:
 
     - name: Find and Prepare Artifacts
       run: |
-        # Создаем папку для загрузки
+        # Создаем папку
         mkdir -p upload_ready
         
         echo "Searching for .ko files..."
-        # Ищем файл jiangnight.ko ВЕЗДЕ внутри kernel-source и копируем в upload_ready
-        find kernel-source -name "*.ko" -type f -exec cp {} upload_ready/ ;
         
-        # Уменьшаем размер найденных файлов
-        llvm-strip --strip-debug upload_ready/*.ko || true
+        # ИСПРАВЛЕНИЕ: Используем простой цикл вместо find -exec, чтобы не ломался синтаксис
+        find kernel-source -name "*.ko" -type f | while read file; do
+            echo "Found module: $file"
+            cp "$file" upload_ready/
+        done
         
-        echo "Files ready to upload:"
+        # Проверяем, что скопировалось
         ls -la upload_ready/
+        
+        # Уменьшаем размер
+        llvm-strip --strip-debug upload_ready/*.ko || true
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
