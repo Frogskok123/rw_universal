@@ -7,28 +7,25 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.kernel-version }}
+    name: Build Kernel ${{ matrix.kernel_version }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          # --- GKI 5.10 ---
-          - kernel-version: 5.10-gki
-            repo_url: https://android.googlesource.com/kernel/common
-            branch: android12-5.10
-            config: gki_defconfig
-            spoof_vermagic: "false"
-            magic_string: ""
+          # --- Конфигурация для 5.10 (Legacy) ---
+          - kernel_version: "5.10-gki"
+            branch: "android12-5.10"
+            ndk_version: "r25c"
+            # Для 5.10 используем старый NDK и стандартные флаги
+            setup_ndk_manually: true
 
-          # --- GKI 6.1 (Android 14) ---
-          - kernel-version: 6.1-gki-dirty
-            repo_url: https://android.googlesource.com/kernel/common
-            branch: android14-6.1
-            config: gki_defconfig
-            spoof_vermagic: "true"
-            # Точная строка
-            magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
+          # --- Конфигурация для 6.1 (Android 14) ---
+          - kernel_version: "6.1-gki"
+            branch: "android14-6.1"
+            ndk_version: "r26d"
+            # Для 6.1 используем action для NDK r26 (так надежнее)
+            setup_ndk_manually: false
 
     steps:
     - name: Checkout driver source
@@ -42,16 +39,29 @@ jobs:
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm libelf-dev
 
-    # ОБНОВЛЕНИЕ: Используем NDK r26d (Clang 17) для совместимости с ядром 6.1
-    - name: Setup Android NDK r26d
-      run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-        unzip -q android-ndk-r26d-linux.zip
-        echo "$GITHUB_WORKSPACE/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+    # --- УСТАНОВКА NDK (Разная логика для 5.10 и 6.1) ---
 
-    - name: Clone Kernel Source
+    # Вариант 1: Для 5.10 (Старый метод)
+    - name: Setup Android NDK (Manual r25c)
+      if: matrix.setup_ndk_manually == true
       run: |
-        git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+    # Вариант 2: Для 6.1 (Новый метод через Action, так как r26 сложнее скачать wget)
+    - name: Setup Android NDK (Action r26d)
+      if: matrix.setup_ndk_manually == false
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+        add-to-path: true
+
+    # --- ПОДГОТОВКА ЯДРА ---
+
+    - name: Clone GKI kernel
+      run: |
+        git clone --depth 1 --branch ${{ matrix.branch }} https://android.googlesource.com/kernel/common kernel-source
 
     - name: Integrate Driver
       run: |
@@ -59,8 +69,22 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        echo 'obj-m += jiangnight.o' > drivers/khack/Makefile
-        echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
+        # Создаем Kconfig/Makefile (как в твоем примере)
+        cat > drivers/khack/Kconfig <<-'EOF'
+        config KERNEL_HACK
+            tristate "JiangNight Memory Hack Driver"
+            default m
+        EOF
+        
+        cat > drivers/khack/Makefile <<-'EOF'
+        obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
+        jiangnight-objs := entry.o 
+        EOF
+        
+        echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
+        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
+
+    # --- СБОРКА ---
 
     - name: Build Module
       env:
@@ -71,53 +95,38 @@ jobs:
       run: |
         cd kernel-source
         
-        # 1. Config
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
+        # 1. Базовый конфиг
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. CONFIG FIXES
-        # Важно: НЕ отключаем MODVERSIONS, так как они есть в твоей строке magic
-        # Вместо полного отключения LTO используем ThinLTO (быстрее полного, но совместимо)
-        ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
-        ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
-        ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
-        
-        # Отключаем подпись, это мешает
-        ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
-        ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
-        
-        # 3. Prepare
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
-        
-        # 4. Flags
-        MY_CFLAGS="-Wno-array-bounds -Wno-error"
-        if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
-             echo "Applying Vermagic spoof..."
-             # Аккуратно пробрасываем строку
-             MAGIC_FLAG='-DMODULE_VERMAGIC="${{ matrix.magic_string }}"'
-        else
-             MAGIC_FLAG=""
+        # 2. СПЕЦИФИКА 6.1: Исправляем Exec format error (включаем ThinLTO и Modversions)
+        if [[ "${{ matrix.kernel_version }}" == "6.1-gki" ]]; then
+            echo "Applying 6.1 specific fixes (ThinLTO)..."
+            ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
+            ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
+            ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
+            # Для 6.1.158 часто нужно явно указать версию (опционально)
+            # EXTRA_CFLAGS="-DMODULE_VERMAGIC="6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions""
         fi
         
-        # 5. Build
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             KCFLAGS="$MY_CFLAGS $MAGIC_FLAG" \
-             -j$(nproc) M=drivers/khack
-
-    - name: Find and Prepare Artifacts
-      run: |
-        mkdir -p upload_ready
-        # Ищем файл
-        find kernel-source -name "*.ko" -type f | while read file; do
-            echo "Found module: $file"
-            cp "$file" upload_ready/
-        done
+        # 3. Добавляем модуль в конфиг
+        echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # Стрипаем, чтобы уменьшить вес, но аккуратно
-        llvm-strip --strip-debug upload_ready/*.ko || true
+        # 4. Подготовка (modules_prepare)
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
+        
+        # 5. Сборка модуля
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
+        
+        # 6. Стриппинг (уменьшение веса)
+        # Ищем файл, так как путь может отличаться
+        find out -name "jiangnight.ko" -exec llvm-strip --strip-debug {} ;
 
-    - name: Upload Artifact
+    # --- ЗАГРУЗКА РЕЗУЛЬТАТА ---
+
+    - name: Upload module
       uses: actions/upload-artifact@v4
       with:
-        name: driver-${{ matrix.kernel-version }}
-        path: upload_ready/*.ko
+        name: jiangnight-${{ matrix.kernel_version }}.ko
+        path: kernel-source/out/**/jiangnight.ko
+        if-no-files-found: error
