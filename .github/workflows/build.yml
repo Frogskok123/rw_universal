@@ -38,7 +38,6 @@ jobs:
                                 python3 python3-pip git wget lld llvm libelf-dev
 
     # --- УСТАНОВКА NDK ---
-
     - name: Setup Android NDK (Manual r25c)
       if: matrix.setup_ndk_manually == true
       run: |
@@ -54,7 +53,6 @@ jobs:
         add-to-path: true
 
     # --- ПОДГОТОВКА ЯДРА ---
-
     - name: Clone GKI kernel
       run: |
         git clone --depth 1 --branch ${{ matrix.branch }} https://android.googlesource.com/kernel/common kernel-source
@@ -80,7 +78,6 @@ jobs:
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
     # --- СБОРКА ---
-
     - name: Build Module
       env:
         ARCH: arm64
@@ -93,9 +90,8 @@ jobs:
         # 1. Базовый конфиг
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. ФИКСЫ ДЛЯ 6.1 (ThinLTO и Modversions)
+        # 2. Fixes
         if [[ "${{ matrix.kernel_version }}" == "6.1-gki" ]]; then
-            echo "Applying 6.1 specific fixes (ThinLTO)..."
             ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
             ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
             ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
@@ -104,21 +100,24 @@ jobs:
         # 3. Добавляем модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
-        
-        # 4. Подготовка
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 5. Сборка
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
-        
-        # Проверка наличия файла (без стриппинга)
-        ls -lh out/drivers/khack/*.ko
+        # 4. Сборка С ОТКЛЮЧЕННОЙ ЗАЩИТОЙ СТЕКА (FIX: Unknown symbol __stack_chk_guard)
+        # Добавил -fno-stack-protector
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+             KCFLAGS="-Wno-array-bounds -Wno-error -fno-stack-protector" \
+             -j$(nproc) M=drivers/khack
 
     # --- ЗАГРУЗКА ---
+    - name: Prepare Artifacts
+      run: |
+        mkdir -p artifacts
+        # Находим файл и копируем
+        find kernel-source -name "jiangnight.ko" -type f -exec cp {} artifacts/ ;
 
     - name: Upload module
       uses: actions/upload-artifact@v4
       with:
-        name: jiangnight-${{ matrix.kernel_version }}.ko
-        path: kernel-source/out/**/jiangnight.ko
+        name: jiangnight-${{ matrix.kernel_version }}
+        path: artifacts/*.ko
         if-no-files-found: error
