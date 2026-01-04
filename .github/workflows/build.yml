@@ -88,15 +88,6 @@ jobs:
              echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
           fi
 
-      - name: Fix DTC Build Error (Simple method)
-        # Просто добавляем флаг -fcommon в Makefile, это самый надежный способ
-        run: |
-          cd kernel-source
-          echo "Applying DTC fix..."
-          echo "HOSTCFLAGS += -fcommon" >> scripts/dtc/Makefile
-          # Также для корня, на всякий случай
-          sed -i 's/^HOSTCFLAGSs*:=/HOSTCFLAGS := -fcommon /' Makefile || true
-
       - name: Build Module
         env:
           ARCH: arm64
@@ -106,13 +97,19 @@ jobs:
         run: |
           cd kernel-source
           
+          # --- FIX: Форсируем -fcommon для хост-компилятора (GCC 10+) ---
+          export KCFLAGS="-fcommon"
+          export KCPPFLAGS="-fcommon"
+          export HOSTCFLAGS="-fcommon"
+          # -------------------------------------------------------------
+          
           echo "Configuring ${{ matrix.config }}..."
           if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
-              make O=out ${{ matrix.config }}
+              make O=out HOSTCFLAGS="-fcommon" ${{ matrix.config }}
           elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
-              make O=out vendor/${{ matrix.config }}
+              make O=out HOSTCFLAGS="-fcommon" vendor/${{ matrix.config }}
           else
-              make O=out defconfig
+              make O=out HOSTCFLAGS="-fcommon" defconfig
           fi
           
           echo "CONFIG_KERNEL_HACK=m" >> out/.config
@@ -120,9 +117,11 @@ jobs:
               echo "CONFIG_MODVERSIONS=n" >> out/.config
           fi
           
-          make O=out olddefconfig
-          make O=out -j$(nproc) modules_prepare
-          make O=out -j$(nproc) M=drivers/khack modules
+          make O=out HOSTCFLAGS="-fcommon" olddefconfig
+          
+          # Передаем HOSTCFLAGS прямо в команду make — это приоритетнее всего
+          make O=out HOSTCFLAGS="-fcommon" -j$(nproc) modules_prepare
+          make O=out HOSTCFLAGS="-fcommon" -j$(nproc) M=drivers/khack modules
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
