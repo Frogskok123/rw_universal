@@ -81,43 +81,43 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. OPTIMIZATION: Отключаем LTO (Ускоряет сборку в разы)
+        # 2. OPTIMIZATION: Disable LTO
         ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG
         ./scripts/config --file out/.config --disable CONFIG_LTO
         ./scripts/config --file out/.config --enable CONFIG_LTO_NONE
         
-        # 3. Отключаем проверки версий и подписей
+        # 3. Disable Checks
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
         
-        # 4. Включаем наш модуль в конфиг
+        # 4. Enable Module
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # 5. Подготовка к сборке
+        # 5. Build Prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 6. ФОРМИРУЕМ ФЛАГИ (Ключевой момент фикса)
-        # Мы передаем VERMAGIC прямо в компилятор, минуя редактирование файлов
-        EXTRA_FLAGS="-Wno-array-bounds -Wno-error"
+        # 6. FIX ARGUMENT PARSING (Исправление ошибки с пробелами)
+        # Мы формируем флаг в отдельной переменной и экранируем её одинарными кавычками
         
+        # Базовые флаги
+        MY_CFLAGS="-Wno-array-bounds -Wno-error"
+        
+        # Если нужен спуфинг
         if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
-             echo "Applying Vermagic spoof: ${{ matrix.magic_string }}"
-             # Экранирование кавычек для передачи строки с пробелами внутрь макроса C
-             EXTRA_FLAGS="$EXTRA_FLAGS -DMODULE_VERMAGIC="\\"${{ matrix.magic_string }}\\"""
+             echo "Applying Vermagic spoof..."
+             # Внимание на кавычки: Мы оборачиваем строку в экранированные двойные кавычки ", 
+             # а потом всю конструкцию заворачиваем в одинарные для make.
+             MAGIC_FLAG='-DMODULE_VERMAGIC="${{ matrix.magic_string }}"'
+        else
+             MAGIC_FLAG=""
         fi
         
-        # 7. Сборка самого модуля
+        # 7. Build with Safe Flags
+        # Передаем MAGIC_FLAG напрямую в командную строку, make сам разберется
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             KCFLAGS="$EXTRA_FLAGS" \
+             KCFLAGS="$MY_CFLAGS $MAGIC_FLAG" \
              -j$(nproc) M=drivers/khack
         
-        # 8. Стриппинг (уменьшение размера)
         llvm-strip --strip-debug out/drivers/khack/*.ko
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: module-${{ matrix.kernel-version }}.ko
-        path: kernel-source/out/drivers/khack/*.ko
