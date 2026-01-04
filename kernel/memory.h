@@ -9,7 +9,31 @@
 #include <linux/module.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/mmap_lock.h>
+#include <linux/version.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+
+// Проверка версии ядра для поддержки 4.19 и 5.x+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+    #include <linux/mmap_lock.h>
+#else
+    // Бэкпорт функций блокировки для ядер < 5.8 (4.14, 4.19 и т.д.)
+    static inline void mmap_read_lock(struct mm_struct *mm) {
+        down_read(&mm->mmap_sem);
+    }
+
+    static inline void mmap_read_unlock(struct mm_struct *mm) {
+        up_read(&mm->mmap_sem);
+    }
+
+    static inline void mmap_write_lock(struct mm_struct *mm) {
+        down_write(&mm->mmap_sem);
+    }
+
+    static inline void mmap_write_unlock(struct mm_struct *mm) {
+        up_write(&mm->mmap_sem);
+    }
+#endif
 #include <linux/highmem.h> // kmap_atomic
 #include <asm/io.h>
 #include <asm/page.h>
