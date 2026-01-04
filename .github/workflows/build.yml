@@ -13,17 +13,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- Конфигурация для 5.10 (Legacy) ---
+          # --- 5.10 (Без изменений) ---
           - kernel_version: "5.10-gki"
             branch: "android12-5.10"
             ndk_version: "r25c"
             setup_ndk_manually: true
+            need_patch: false
 
-          # --- Конфигурация для 6.1 (Android 14) ---
+          # --- 6.1 (С ПАТЧЕМ) ---
           - kernel_version: "6.1-gki"
             branch: "android14-6.1"
             ndk_version: "r26d"
             setup_ndk_manually: false
+            need_patch: true  # Включаем патч кода
 
     steps:
     - name: Checkout driver source
@@ -37,7 +39,7 @@ jobs:
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm libelf-dev
 
-    # --- УСТАНОВКА NDK ---
+    # --- NDK ---
     - name: Setup Android NDK (Manual r25c)
       if: matrix.setup_ndk_manually == true
       run: |
@@ -52,7 +54,7 @@ jobs:
         ndk-version: r26d
         add-to-path: true
 
-    # --- ПОДГОТОВКА ЯДРА ---
+    # --- KERNEL ---
     - name: Clone GKI kernel
       run: |
         git clone --depth 1 --branch ${{ matrix.branch }} https://android.googlesource.com/kernel/common kernel-source
@@ -63,19 +65,56 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
+        # Создаем Makefile/Kconfig
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
-            tristate "JiangNight Memory Hack Driver"
+            tristate "Hack Driver"
             default m
         EOF
-        
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
         EOF
-        
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
+
+    # --- КЛЮЧЕВОЙ ШАГ: ПАТЧ КОДА ДЛЯ 6.1 ---
+    - name: Patch Code for GKI 6.1 (Fix Panic)
+      if: matrix.need_patch == true
+      run: |
+        cd kernel-source/drivers/khack
+        
+        echo "Injecting KPROBE resolver into entry.c..."
+        
+        # 1. Создаем хедер с "лекарством"
+        cat > gki_fix.h <<'EOF'
+        #include <linux/kprobes.h>
+        
+        /* Умная функция поиска символов через Kprobe */
+        static unsigned long (*_kallsyms_lookup_name_ptr)(const char *name) = NULL;
+        static struct kprobe _kp = { .symbol_name = "kallsyms_lookup_name" };
+        
+        static unsigned long kallsyms_lookup_name_gki(const char *name) {
+            if (_kallsyms_lookup_name_ptr) 
+                return _kallsyms_lookup_name_ptr(name);
+            
+            /* Если адрес еще не найден, ищем его */
+            if (register_kprobe(&_kp) < 0) return 0;
+            _kallsyms_lookup_name_ptr = (void *)_kp.addr;
+            unregister_kprobe(&_kp);
+            
+            if (!_kallsyms_lookup_name_ptr) return 0;
+            return _kallsyms_lookup_name_ptr(name);
+        }
+        
+        /* Подменяем стандартный вызов на наш */
+        #define kallsyms_lookup_name kallsyms_lookup_name_gki
+        EOF
+        
+        # 2. Вставляем include в самое начало entry.c
+        sed -i '1i #include "gki_fix.h"' entry.c
+        
+        echo "Patch applied successfully!"
 
     # --- СБОРКА ---
     - name: Build Module
@@ -87,39 +126,30 @@ jobs:
       run: |
         cd kernel-source
         
-        # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. Fixes (ThinLTO для 6.1)
         if [[ "${{ matrix.kernel_version }}" == "6.1-gki" ]]; then
             ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
             ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
             ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
         fi
         
-        # 3. Add Module
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 4. BUILD (С ФЛАГОМ -fno-stack-protector)
+        # -fno-stack-protector обязателен
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
              KCFLAGS="-Wno-array-bounds -Wno-error -fno-stack-protector" \
              -j$(nproc) M=drivers/khack
 
-    # --- ЗАГРУЗКА (ИСПРАВЛЕННЫЙ МЕТОД) ---
+    # --- ЗАГРУЗКА ---
     - name: Prepare Artifacts
       run: |
         mkdir -p artifacts
-        echo "Searching for .ko files..."
-        
-        # Используем цикл вместо -exec (это надежнее в YAML)
         find kernel-source -name "jiangnight.ko" -type f | while read file; do
-            echo "Found: $file"
             cp "$file" artifacts/
         done
-        
-        ls -la artifacts/
 
     - name: Upload module
       uses: actions/upload-artifact@v4
