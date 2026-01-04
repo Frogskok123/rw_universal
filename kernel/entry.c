@@ -45,7 +45,39 @@ static int dispatch_close(struct inode *node, struct file *file) {
     }
     return 0;
 }
+// entry.c
 
+// Функция для подмены контекста потока с аргументами
+int hijack_thread_with_args(THREAD_HIJACK_ARGS *ctx) {
+    struct task_struct *task;
+    struct pt_regs *regs;
+
+    // 1. Находим задачу по TID
+    task = pid_task(find_vpid(ctx->pid), PIDTYPE_PID);
+    if (!task) return -ESRCH;
+
+    // 2. Получаем доступ к регистрам процессора
+    regs = task_pt_regs(task);
+    if (!regs) return -EFAULT;
+
+    // 3. Подменяем PC (Instruction Pointer) и аргументы
+    // В ARM64:
+    // pc = rip
+    // regs[0]...regs[3] = x0...x3
+    
+    regs->pc = ctx->rip;       // Прыгаем на наш шеллкод
+    regs->regs[0] = ctx->x0;   // X0
+    regs->regs[1] = ctx->x1;   // X1
+    regs->regs[2] = ctx->x2;   // X2
+    regs->regs[3] = ctx->x3;   // X3
+    
+    // Опционально: можно сбросить Link Register (LR), чтобы крашнуть поток после выполнения, 
+    // если шеллкод не восстановит управление, но наш шеллкод делает RET, так что LR не трогаем 
+    // или устанавливаем в 0, если хотим поймать конец.
+    // Но лучше оставить как есть, надеясь на правильный пролог/эпилог в шеллкоде.
+
+    return 0;
+}
 // Основной диспетчер IOCTL
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
@@ -100,7 +132,16 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             rcu_read_unlock();
             if (hide_pid_task_ptr) hide_pid_process(hide_pid_task_ptr);
             break;
+// entry.c -> static long dev_ioctl(...)
 
+case OP_HIJACK_THREAD_ARGS: {
+    THREAD_HIJACK_ARGS ctx;
+    if (copy_from_user(&ctx, (void __user *)arg, sizeof(ctx))) {
+        return -EFAULT;
+    }
+    // Вызываем нашу новую функцию
+    return hijack_thread_with_args(&ctx);
+}
         case OP_GET_PROCESS_PID:
             if (copy_from_user(&p_process, (void __user*)arg, sizeof(p_process))) return -EFAULT;
             p_process.process_pid = get_process_pid(p_process.process_comm);
