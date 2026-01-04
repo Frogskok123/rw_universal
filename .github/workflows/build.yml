@@ -13,20 +13,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- GKI 5.10 (Legacy Stable) ---
+          # --- GKI 5.10 (Legacy) ---
           - kernel-version: 5.10-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
             config: gki_defconfig
-            spoof_vermagic: false  # На 5.10 обычно работает без подмены, если версия совпадает
+            spoof_vermagic: "false"
+            magic_string: ""
 
           # --- GKI 6.1 (Android 14/15 Dirty) ---
           - kernel-version: 6.1-gki-dirty
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
             config: gki_defconfig
-            spoof_vermagic: true
-            # Строка подмены для твоего телефона (из uname -r)
+            spoof_vermagic: "true"
             magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
 
     steps:
@@ -50,35 +50,33 @@ jobs:
     - name: Clone Kernel Source
       run: |
         git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
+
     - name: Integrate Driver
       run: |
         cd kernel-source
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # === SPOOFING LOGIC (Только для 6.1 Dirty) ===
-        if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
-            echo "Spoofing Vermagic to: ${{ matrix.magic_string }}"
-            # Вставляем макрос в начало entry.c
-            sed -i '1i #include <linux/vermagic.h>
-#undef MODULE_VERMAGIC
-#define MODULE_VERMAGIC "${{ matrix.magic_string }}"' drivers/khack/entry.c
-        fi
-
         # Генерация Kconfig/Makefile
-        cat > drivers/khack/Kconfig <<-'EOF'
-        config KERNEL_HACK
-            tristate "Memory Hack"
-            default m
-        EOF
+        echo 'config KERNEL_HACK' > drivers/khack/Kconfig
+        echo '    tristate "Memory Hack"' >> drivers/khack/Kconfig
+        echo '    default m' >> drivers/khack/Kconfig
         
-        cat > drivers/khack/Makefile <<-'EOF'
-        obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o 
-        EOF
+        echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
+        echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
         
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
+
+    - name: Spoof Vermagic (Only if needed)
+      if: matrix.spoof_vermagic == 'true'
+      run: |
+        cd kernel-source/drivers/khack
+        echo "Spoofing Vermagic..."
+        # Используем printf для безопасной вставки строки с пробелами
+        sed -i '1i #include <linux/vermagic.h>
+#undef MODULE_VERMAGIC
+#define MODULE_VERMAGIC "${{ matrix.magic_string }}"' entry.c
 
     - name: Build Module
       env:
@@ -92,12 +90,10 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. Disable Checks (Критично для 6.1 Dirty)
+        # 2. Disable Checks
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
-        # Также отключаем защиту от загрузки неподписанных модулей в ядре (если возможно)
-        ./scripts/config --file out/.config --disable CONFIG_SECURITY_LOCKDOWN_LSM
         
         # 3. Enable Module
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
