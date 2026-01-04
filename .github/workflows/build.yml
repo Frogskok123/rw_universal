@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- GKI 5.10 (Android 12/13) ---
+          # --- GKI 5.10 ---
           - kernel-version: 5.10-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
@@ -21,12 +21,13 @@ jobs:
             spoof_vermagic: "false"
             magic_string: ""
 
-          # --- GKI 6.1 (Android 14/15) ---
+          # --- GKI 6.1 (Android 14) ---
           - kernel-version: 6.1-gki-dirty
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
             config: gki_defconfig
             spoof_vermagic: "true"
+            # Точная строка
             magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
 
     steps:
@@ -41,11 +42,12 @@ jobs:
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm libelf-dev
 
-    - name: Setup Android NDK
+    # ОБНОВЛЕНИЕ: Используем NDK r26d (Clang 17) для совместимости с ядром 6.1
+    - name: Setup Android NDK r26d
       run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
-        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+        unzip -q android-ndk-r26d-linux.zip
+        echo "$GITHUB_WORKSPACE/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone Kernel Source
       run: |
@@ -57,7 +59,6 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Принудительная сборка через obj-m
         echo 'obj-m += jiangnight.o' > drivers/khack/Makefile
         echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
 
@@ -73,50 +74,46 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. Disable LTO
-        ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG
-        ./scripts/config --file out/.config --disable CONFIG_LTO
-        ./scripts/config --file out/.config --enable CONFIG_LTO_NONE
+        # 2. CONFIG FIXES
+        # Важно: НЕ отключаем MODVERSIONS, так как они есть в твоей строке magic
+        # Вместо полного отключения LTO используем ThinLTO (быстрее полного, но совместимо)
+        ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
+        ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
+        ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
         
-        # 3. Disable Checks
-        ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
+        # Отключаем подпись, это мешает
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
         
-        # 4. Prepare
+        # 3. Prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 5. Build
+        # 4. Flags
         MY_CFLAGS="-Wno-array-bounds -Wno-error"
         if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
              echo "Applying Vermagic spoof..."
+             # Аккуратно пробрасываем строку
              MAGIC_FLAG='-DMODULE_VERMAGIC="${{ matrix.magic_string }}"'
         else
              MAGIC_FLAG=""
         fi
         
+        # 5. Build
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
              KCFLAGS="$MY_CFLAGS $MAGIC_FLAG" \
              -j$(nproc) M=drivers/khack
 
     - name: Find and Prepare Artifacts
       run: |
-        # Создаем папку
         mkdir -p upload_ready
-        
-        echo "Searching for .ko files..."
-        
-        # ИСПРАВЛЕНИЕ: Используем простой цикл вместо find -exec, чтобы не ломался синтаксис
+        # Ищем файл
         find kernel-source -name "*.ko" -type f | while read file; do
             echo "Found module: $file"
             cp "$file" upload_ready/
         done
         
-        # Проверяем, что скопировалось
-        ls -la upload_ready/
-        
-        # Уменьшаем размер
+        # Стрипаем, чтобы уменьшить вес, но аккуратно
         llvm-strip --strip-debug upload_ready/*.ko || true
 
     - name: Upload Artifact
