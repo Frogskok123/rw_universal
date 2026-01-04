@@ -16,8 +16,8 @@ jobs:
           # --- MediaTek Common Kernel (4.19) ---
           - kernel-version: 4.19-mtk
             repo_url: https://github.com/MediaTek-Labs/common-kernel-4.19.git
-            branch: master  # Или 'main', проверь если упадет
-            config: defconfig # Используем дефолтный, так как это bare metal репо
+            branch: master
+            config: defconfig
             use_ndk: true
 
           # --- Google GKI Kernels ---
@@ -66,13 +66,31 @@ jobs:
     - name: Setup Android NDK
       if: matrix.use_ndk
       run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
-        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        # Логика выбора NDK:
+        # 4.19 требует GCC, который удалили в новых NDK. Используем r21e.
+        # 5.4+ собираются Clang'ом из r25c.
+        
+        if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
+            echo "Using NDK r21e (Legacy with GCC) for Kernel 4.19"
+            wget -q https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip
+            unzip -q android-ndk-r21e-linux-x86_64.zip
+            mv android-ndk-r21e android-ndk
+            
+            # Добавляем путь к GCC (aarch64-linux-android-4.9)
+            echo "$GITHUB_WORKSPACE/android-ndk/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        else
+            echo "Using NDK r25c (Modern Clang) for GKI"
+            wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+            unzip -q android-ndk-r25c-linux.zip
+            mv android-ndk-r25c android-ndk
+        fi
+        
+        # Общий путь к LLVM/Clang
+        echo "$GITHUB_WORKSPACE/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone Kernel Source
       run: |
-        # Для MTK репо может быть большим, depth 1 обязателен
+        # Depth 1 для скорости
         git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
 
     - name: Integrate Driver
@@ -96,6 +114,7 @@ jobs:
     - name: Build Module
       env:
         ARCH: arm64
+        # Переменные окружения для кросс-компиляции
         CROSS_COMPILE: aarch64-linux-android-
         LLVM: 1
         LLVM_IAS: 1
@@ -104,19 +123,25 @@ jobs:
         
         echo "Configuring ${{ matrix.config }}..."
         
-        # Попытка найти конфиг, если он лежит нестандартно
+        # Попытка найти конфиг (он может быть в vendor/ или в корне configs/)
         if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
             make O=out ${{ matrix.config }}
         elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
             make O=out vendor/${{ matrix.config }}
         else
-            # Если конфиг не найден, пробуем defconfig
-            echo "Config ${{ matrix.config }} not found, fallback to defconfig"
+            echo "Config ${{ matrix.config }} not found, checking available..."
+            # Если специфичного конфига нет, пробуем defconfig
             make O=out defconfig
         fi
         
-        # Включаем модуль
+        # Добавляем модуль в .config
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        
+        # Для 4.19 может потребоваться отключить проверку версий, чтобы модуль загружался
+        if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
+            echo "CONFIG_MODVERSIONS=n" >> out/.config
+        fi
+        
         make O=out olddefconfig
         
         # Сборка
