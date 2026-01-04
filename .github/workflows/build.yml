@@ -87,33 +87,39 @@ jobs:
       run: |
         cd kernel-source
         
-        # 1. Базовый конфиг
+        # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. Fixes
+        # 2. Fixes (ThinLTO для 6.1)
         if [[ "${{ matrix.kernel_version }}" == "6.1-gki" ]]; then
             ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
             ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
             ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
         fi
         
-        # 3. Добавляем модуль
+        # 3. Add Module
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 4. Сборка С ОТКЛЮЧЕННОЙ ЗАЩИТОЙ СТЕКА (FIX: Unknown symbol __stack_chk_guard)
-        # Добавил -fno-stack-protector
+        # 4. BUILD (С ФЛАГОМ -fno-stack-protector)
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
              KCFLAGS="-Wno-array-bounds -Wno-error -fno-stack-protector" \
              -j$(nproc) M=drivers/khack
 
-    # --- ЗАГРУЗКА ---
+    # --- ЗАГРУЗКА (ИСПРАВЛЕННЫЙ МЕТОД) ---
     - name: Prepare Artifacts
       run: |
         mkdir -p artifacts
-        # Находим файл и копируем
-        find kernel-source -name "jiangnight.ko" -type f -exec cp {} artifacts/ ;
+        echo "Searching for .ko files..."
+        
+        # Используем цикл вместо -exec (это надежнее в YAML)
+        find kernel-source -name "jiangnight.ko" -type f | while read file; do
+            echo "Found: $file"
+            cp "$file" artifacts/
+        done
+        
+        ls -la artifacts/
 
     - name: Upload module
       uses: actions/upload-artifact@v4
