@@ -1,4 +1,4 @@
-name: Build Kernel Modules (Alioth 4.19 + GKI)
+name: Build Kernel Modules (MTK 4.19 + GKI)
 
 on:
   push:
@@ -13,33 +13,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- Custom Kernels ---
+          # --- MediaTek Common Kernel (4.19) ---
+          - kernel-version: 4.19-mtk
+            repo_url: https://github.com/MediaTek-Labs/common-kernel-4.19.git
+            branch: master  # Или 'main', проверь если упадет
+            config: defconfig # Используем дефолтный, так как это bare metal репо
+            use_ndk: true
+
+          # --- Google GKI Kernels ---
           
-          # POCO F3 (Alioth) - Kernel 4.19
-          - kernel-version: 4.19-alioth
-            repo_url: https://github.com/raystef66/InfiniR_kernel_alioth
-            branch: user # Или 'main', проверь в репо. Обычно 'user' или 'eleven'
-            config: alioth_defconfig
-            arch: arm64
-            llvm_ver: 12 # Для 4.19 нужен старый Clang
+          # Android 11 (5.4)
+          - kernel-version: 5.4-gki
+            repo_url: https://android.googlesource.com/kernel/common
+            branch: android11-5.4
+            config: gki_defconfig
+            use_ndk: true
 
-          # --- Google GKI ---
-
-          # Android 12 (5.10)
+          # Android 12/13 (5.10)
           - kernel-version: 5.10-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
             config: gki_defconfig
-            arch: arm64
-            llvm_ver: 14
+            use_ndk: true
 
-          # Android 14 (6.1)
+          # Android 14 (5.15)
+          - kernel-version: 5.15-gki
+            repo_url: https://android.googlesource.com/kernel/common
+            branch: android14-5.15
+            config: gki_defconfig
+            use_ndk: true
+
+          # Android 14/15 (6.1)
           - kernel-version: 6.1-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
             config: gki_defconfig
-            arch: arm64
-            llvm_ver: 17
+            use_ndk: true
 
     steps:
     - name: Checkout driver source
@@ -54,29 +63,17 @@ jobs:
                                 python3 python3-pip git wget lld llvm \
                                 libelf-dev
 
-    - name: Setup Clang/LLVM
+    - name: Setup Android NDK
+      if: matrix.use_ndk
       run: |
-        # Скачиваем AOSP Clang подходящей версии
-        mkdir -p clang
-        if [[ "${{ matrix.llvm_ver }}" == "12" ]]; then
-           wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz -O clang.tar.gz
-        else
-           # Дефолтный новый Clang для GKI
-           wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz -O clang.tar.gz
-        fi
-        tar -xf clang.tar.gz -C clang
-        echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone Kernel Source
       run: |
+        # Для MTK репо может быть большим, depth 1 обязателен
         git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
-
-    - name: Setup KernelSU (for Alioth)
-      if: matrix.kernel-version == '4.19-alioth'
-      run: |
-        cd kernel-source
-        # Alioth ядро требует KSU setup
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
 
     - name: Integrate Driver
       run: |
@@ -84,51 +81,45 @@ jobs:
         mkdir -p drivers/khack
         cp -r $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Создаем Kconfig/Makefile, если их нет в исходниках драйвера
         echo 'config KERNEL_HACK' > drivers/khack/Kconfig
-        echo '    tristate "JiangNight Hack"' >> drivers/khack/Kconfig
+        echo '    tristate "JiangNight Memory Hack"' >> drivers/khack/Kconfig
         echo '    default m' >> drivers/khack/Kconfig
         
         echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
         echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
         
-        # Добавляем в дерево
-        if grep -q "drivers/khack" drivers/Kconfig; then
-           echo "Already integrated"
-        else
+        if ! grep -q "drivers/khack" drivers/Kconfig; then
            echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
            echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
         fi
 
     - name: Build Module
       env:
-        ARCH: ${{ matrix.arch }}
-        CROSS_COMPILE: aarch64-linux-gnu-
-        CROSS_COMPILE_ARM32: arm-linux-gnueabi-
-        CC: clang
-        LD: ld.lld
-        AR: llvm-ar
-        NM: llvm-nm
-        OBJCOPY: llvm-objcopy
-        OBJDUMP: llvm-objdump
-        STRIP: llvm-strip
+        ARCH: arm64
+        CROSS_COMPILE: aarch64-linux-android-
+        LLVM: 1
+        LLVM_IAS: 1
       run: |
         cd kernel-source
         
-        # 1. Config
-        # Для Alioth конфиг лежит в arch/arm64/configs/vendor/alioth_defconfig или просто alioth_defconfig
-        # Проверим где он
-        if [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
+        echo "Configuring ${{ matrix.config }}..."
+        
+        # Попытка найти конфиг, если он лежит нестандартно
+        if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
+            make O=out ${{ matrix.config }}
+        elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
             make O=out vendor/${{ matrix.config }}
         else
-            make O=out ${{ matrix.config }}
+            # Если конфиг не найден, пробуем defconfig
+            echo "Config ${{ matrix.config }} not found, fallback to defconfig"
+            make O=out defconfig
         fi
         
-        # 2. Enable Module
+        # Включаем модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out olddefconfig
         
-        # 3. Build
+        # Сборка
         make O=out -j$(nproc) modules_prepare
         make O=out -j$(nproc) M=drivers/khack modules
 
@@ -137,3 +128,4 @@ jobs:
       with:
         name: module-${{ matrix.kernel-version }}.ko
         path: kernel-source/out/drivers/khack/*.ko
+        if-no-files-found: error
