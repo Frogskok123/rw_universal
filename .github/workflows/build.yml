@@ -1,4 +1,4 @@
-name: Build GKI Kernel Modules (4.19, 5.4, 5.10, 5.15, 6.1)
+name: Build Kernel Modules (Alioth 4.19 + GKI)
 
 on:
   push:
@@ -7,37 +7,39 @@ on:
 
 jobs:
   build:
-    name: Build Kernel ${{ matrix.kernel-version }}
+    name: Build ${{ matrix.kernel-version }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Android 10/11 (Legacy Stable) - Added 4.19
-          - kernel-version: 4.19.312
-            branch: android-4.19
-           #  config: gki_defconfig # Часто используется gki_defconfig, но если нужен perf, раскомментируй ниже
-            config: perf_defconfig 
+          # --- Custom Kernels ---
+          
+          # POCO F3 (Alioth) - Kernel 4.19
+          - kernel-version: 4.19-alioth
+            repo_url: https://github.com/raystef66/InfiniR_kernel_alioth
+            branch: user # Или 'main', проверь в репо. Обычно 'user' или 'eleven'
+            config: alioth_defconfig
+            arch: arm64
+            llvm_ver: 12 # Для 4.19 нужен старый Clang
 
-          # Android 11 (Legacy GKI)
-          - kernel-version: 5.4
-            branch: android11-5.4
-            config: gki_defconfig
-            
-          # Android 12/13 (Stable)
-          - kernel-version: 5.10
+          # --- Google GKI ---
+
+          # Android 12 (5.10)
+          - kernel-version: 5.10-gki
+            repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
             config: gki_defconfig
+            arch: arm64
+            llvm_ver: 14
 
-          # Android 14 (Current)
-          - kernel-version: 5.15
-            branch: android14-5.15
-            config: gki_defconfig
-            
-          # Android 14/15 (Latest)
-          - kernel-version: 6.1
+          # Android 14 (6.1)
+          - kernel-version: 6.1-gki
+            repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
             config: gki_defconfig
+            arch: arm64
+            llvm_ver: 17
 
     steps:
     - name: Checkout driver source
@@ -52,79 +54,86 @@ jobs:
                                 python3 python3-pip git wget lld llvm \
                                 libelf-dev
 
-    - name: Setup Android NDK
+    - name: Setup Clang/LLVM
       run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
-        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        # Скачиваем AOSP Clang подходящей версии
+        mkdir -p clang
+        if [[ "${{ matrix.llvm_ver }}" == "12" ]]; then
+           wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz -O clang.tar.gz
+        else
+           # Дефолтный новый Clang для GKI
+           wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz -O clang.tar.gz
+        fi
+        tar -xf clang.tar.gz -C clang
+        echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
 
-    - name: Clone GKI kernel (${{ matrix.branch }})
+    - name: Clone Kernel Source
       run: |
-        git clone --depth 1 --branch ${{ matrix.branch }} https://android.googlesource.com/kernel/common gki-kernel
+        git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
 
-    - name: Integrate driver into kernel tree
+    - name: Setup KernelSU (for Alioth)
+      if: matrix.kernel-version == '4.19-alioth'
       run: |
-        cd gki-kernel
+        cd kernel-source
+        # Alioth ядро требует KSU setup
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+    - name: Integrate Driver
+      run: |
+        cd kernel-source
         mkdir -p drivers/khack
-        cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
+        cp -r $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        cat > drivers/khack/Kconfig <<-'EOF'
-        config KERNEL_HACK
-            tristate "JiangNight Memory Hack Driver"
-            default m
-        EOF
+        # Создаем Kconfig/Makefile, если их нет в исходниках драйвера
+        echo 'config KERNEL_HACK' > drivers/khack/Kconfig
+        echo '    tristate "JiangNight Hack"' >> drivers/khack/Kconfig
+        echo '    default m' >> drivers/khack/Kconfig
         
-        cat > drivers/khack/Makefile <<-'EOF'
-        obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o 
-        EOF
+        echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
+        echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
         
-        echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
-        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
-
-    - name: Configure and Build
-      env:
-        ARCH: arm64
-        LLVM: 1
-        LLVM_IAS: 1
-        CROSS_COMPILE: aarch64-linux-android-
-        CLANG_TRIPLE: aarch64-linux-gnu-
-      run: |
-        cd gki-kernel
-        
-        # Специальная обработка для старых ядер (4.19), где могут быть нюансы с конфигом
-        if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
-             echo "Applying fixes for 4.19..."
-             # Иногда нужно явно отключить проверку версий модулей для хак-драйверов
-             echo "CONFIG_MODVERSIONS=n" >> out/.config
+        # Добавляем в дерево
+        if grep -q "drivers/khack" drivers/Kconfig; then
+           echo "Already integrated"
+        else
+           echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
+           echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
         fi
 
-        # 1. Конфигурация
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-             ${{ matrix.config }}
+    - name: Build Module
+      env:
+        ARCH: ${{ matrix.arch }}
+        CROSS_COMPILE: aarch64-linux-gnu-
+        CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+        CC: clang
+        LD: ld.lld
+        AR: llvm-ar
+        NM: llvm-nm
+        OBJCOPY: llvm-objcopy
+        OBJDUMP: llvm-objdump
+        STRIP: llvm-strip
+      run: |
+        cd kernel-source
         
-        # 2. Включаем модуль
+        # 1. Config
+        # Для Alioth конфиг лежит в arch/arm64/configs/vendor/alioth_defconfig или просто alioth_defconfig
+        # Проверим где он
+        if [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
+            make O=out vendor/${{ matrix.config }}
+        else
+            make O=out ${{ matrix.config }}
+        fi
+        
+        # 2. Enable Module
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        make O=out olddefconfig
         
-        # Обновляем конфиг
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-             olddefconfig
-        
-        # 3. Подготовка
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-             -j$(nproc) modules_prepare
-        
-        # 4. Сборка модуля
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-             -j$(nproc) M=drivers/khack
+        # 3. Build
+        make O=out -j$(nproc) modules_prepare
+        make O=out -j$(nproc) M=drivers/khack modules
 
-    - name: Upload module
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: jiangnight-${{ matrix.kernel-version }}.ko
-        path: gki-kernel/out/**/jiangnight.ko
-        if-no-files-found: error
+        name: module-${{ matrix.kernel-version }}.ko
+        path: kernel-source/out/drivers/khack/*.ko
