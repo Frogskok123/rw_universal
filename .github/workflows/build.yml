@@ -27,7 +27,6 @@ jobs:
             branch: android14-6.1
             config: gki_defconfig
             spoof_vermagic: "true"
-            # Строка подмены (из uname -r на твоем устройстве)
             magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
 
     steps:
@@ -58,18 +57,11 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Генерация Kconfig/Makefile для драйвера
-        echo 'config KERNEL_HACK' > drivers/khack/Kconfig
-        echo '    tristate "Memory Hack"' >> drivers/khack/Kconfig
-        echo '    default m' >> drivers/khack/Kconfig
-        
-        echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
+        # Используем obj-m напрямую - это самый надежный метод
+        echo 'obj-m += jiangnight.o' > drivers/khack/Makefile
         echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
-        
-        echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
-        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-    - name: Build Module (Fast Mode + Vermagic Override)
+    - name: Build Module
       env:
         ARCH: arm64
         LLVM: 1
@@ -81,7 +73,7 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. OPTIMIZATION: Disable LTO
+        # 2. Disable LTO (Speed up)
         ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG
         ./scripts/config --file out/.config --disable CONFIG_LTO
         ./scripts/config --file out/.config --enable CONFIG_LTO_NONE
@@ -91,33 +83,41 @@ jobs:
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
         
-        # 4. Enable Module
-        echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        # 4. Prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
-        
-        # 5. Build Prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 6. FIX ARGUMENT PARSING (Исправление ошибки с пробелами)
-        # Мы формируем флаг в отдельной переменной и экранируем её одинарными кавычками
-        
-        # Базовые флаги
+        # 5. Build with Vermagic Fix (Safe method)
         MY_CFLAGS="-Wno-array-bounds -Wno-error"
         
-        # Если нужен спуфинг
         if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
              echo "Applying Vermagic spoof..."
-             # Внимание на кавычки: Мы оборачиваем строку в экранированные двойные кавычки ", 
-             # а потом всю конструкцию заворачиваем в одинарные для make.
              MAGIC_FLAG='-DMODULE_VERMAGIC="${{ matrix.magic_string }}"'
         else
              MAGIC_FLAG=""
         fi
         
-        # 7. Build with Safe Flags
-        # Передаем MAGIC_FLAG напрямую в командную строку, make сам разберется
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
              KCFLAGS="$MY_CFLAGS $MAGIC_FLAG" \
              -j$(nproc) M=drivers/khack
+
+    - name: Find and Prepare Artifacts
+      run: |
+        # Создаем папку для загрузки
+        mkdir -p upload_ready
         
-        llvm-strip --strip-debug out/drivers/khack/*.ko
+        echo "Searching for .ko files..."
+        # Ищем файл jiangnight.ko ВЕЗДЕ внутри kernel-source и копируем в upload_ready
+        find kernel-source -name "*.ko" -type f -exec cp {} upload_ready/ ;
+        
+        # Уменьшаем размер найденных файлов
+        llvm-strip --strip-debug upload_ready/*.ko || true
+        
+        echo "Files ready to upload:"
+        ls -la upload_ready/
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: driver-${{ matrix.kernel-version }}
+        path: upload_ready/*.ko
