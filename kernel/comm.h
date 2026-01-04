@@ -62,7 +62,7 @@ typedef struct _DEBUG_EVENT {
 // comm.h
 
 // Добавляем новый IOCTL код, если его нет
-#define OP_HIJACK_THREAD_ARGS 0x805 // Новый код для вызова с аргументами
+#define OP_HIJACK_THREAD_ARGS 0x810 // Новый код для вызова с аргументами
 
 // Обновленная структура для передачи регистров
 typedef struct _THREAD_HIJACK_ARGS {
