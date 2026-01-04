@@ -21,29 +21,24 @@ jobs:
             use_ndk: true
 
           # --- Google GKI Kernels ---
-          
-          # Android 11 (5.4)
           - kernel-version: 5.4-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android11-5.4
             config: gki_defconfig
             use_ndk: true
 
-          # Android 12/13 (5.10)
           - kernel-version: 5.10-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android12-5.10
             config: gki_defconfig
             use_ndk: true
 
-          # Android 14 (5.15)
           - kernel-version: 5.15-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-5.15
             config: gki_defconfig
             use_ndk: true
 
-          # Android 14/15 (6.1)
           - kernel-version: 6.1-gki
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
@@ -59,7 +54,6 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        # Устанавливаем системный GCC для aarch64, чтобы избежать ошибок "gcc not found" в старых ядрах
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm \
                                 libelf-dev gcc-aarch64-linux-gnu
@@ -67,7 +61,6 @@ jobs:
     - name: Setup Android NDK (Clang only)
       if: matrix.use_ndk
       run: |
-        # Используем NDK r25c для Clang
         wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
         unzip -q android-ndk-r25c-linux.zip
         mv android-ndk-r25c android-ndk
@@ -75,7 +68,6 @@ jobs:
 
     - name: Clone Kernel Source
       run: |
-        # Используем depth 1 для ускорения
         git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
 
     - name: Integrate Driver
@@ -84,7 +76,6 @@ jobs:
         mkdir -p drivers/khack
         cp -r $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Генерируем Kconfig и Makefile
         echo 'config KERNEL_HACK' > drivers/khack/Kconfig
         echo '    tristate "JiangNight Memory Hack"' >> drivers/khack/Kconfig
         echo '    default m' >> drivers/khack/Kconfig
@@ -92,26 +83,25 @@ jobs:
         echo 'obj-$(CONFIG_KERNEL_HACK) += jiangnight.o' > drivers/khack/Makefile
         echo 'jiangnight-objs := entry.o' >> drivers/khack/Makefile
         
-        # Подключаем драйвер к дереву ядра
         if ! grep -q "drivers/khack" drivers/Kconfig; then
            echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
            echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
         fi
 
-    - name: Fix DTC Build Error (Duplicate symbol yylloc)
-      # Этот шаг критичен для сборки ядер 4.19 и 5.4 современным GCC 10+
+    - name: Fix DTC Build Error (CFLAGS method)
+      # This forces GCC to allow multiple definitions of yylloc, fixing the error
       run: |
         cd kernel-source
-        echo "Applying DTC fix for GCC 10+..."
-        # Меняем определение переменной на extern в лексере DTC
-        if [ -f "scripts/dtc/dtc-lexer.lex.c_shipped" ]; then
-            sed -i 's/^YYLTYPE yylloc;$/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped
-        fi
+        echo "Applying DTC CFLAGS fix..."
+        # Modify scripts/dtc/Makefile to add -fcommon to host flags
+        sed -i 's/HOSTCFLAGS/HOSTCFLAGS += -fcommon
+HOSTCFLAGS/' scripts/dtc/Makefile 2>/dev/null || true
+        # Also modify the root Makefile for HOSTCFLAGS just in case
+        sed -i 's/^HOSTCFLAGSs*:=/HOSTCFLAGS := -fcommon /' Makefile
 
     - name: Build Module
       env:
         ARCH: arm64
-        # Используем системный GCC для вспомогательных скриптов, а Clang для компиляции кода
         CROSS_COMPILE: aarch64-linux-gnu-
         LLVM: 1
         LLVM_IAS: 1
@@ -119,33 +109,21 @@ jobs:
         cd kernel-source
         
         echo "Configuring ${{ matrix.config }}..."
-        
-        # Логика поиска конфига
         if [ -f "arch/arm64/configs/${{ matrix.config }}" ]; then
             make O=out ${{ matrix.config }}
         elif [ -f "arch/arm64/configs/vendor/${{ matrix.config }}" ]; then
             make O=out vendor/${{ matrix.config }}
         else
-            echo "Config ${{ matrix.config }} not found, fallback to defconfig"
             make O=out defconfig
         fi
         
-        # Включаем наш драйвер
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
-        
-        # Отключаем проверку версий символов для старых ядер (4.19), чтобы модуль грузился на разных версиях
         if [[ "${{ matrix.kernel-version }}" == "4.19"* ]]; then
             echo "CONFIG_MODVERSIONS=n" >> out/.config
         fi
         
-        # Обновляем конфиг
         make O=out olddefconfig
-        
-        # Сборка
-        # 1. Подготовка заголовков и скриптов
         make O=out -j$(nproc) modules_prepare
-        
-        # 2. Сборка модуля
         make O=out -j$(nproc) M=drivers/khack modules
 
     - name: Upload Artifact
