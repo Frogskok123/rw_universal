@@ -59,20 +59,19 @@ typedef struct _DEBUG_EVENT {
 // В enum OPERATIONS добавь:
 
 // Определяем структуру, идентичную той, что в драйвере
-struct THREAD_HIJACK_ARGS {
-    int32_t pid;
-    uint64_t rip;
-    uint64_t x0;
-    uint64_t x1;
-    uint64_t x2;
-    uint64_t x3;
-};
+// comm.h
 
-#define OP_HIJACK_THREAD_ARGS 0x810 // Тот же код, что и в драйвере
+// Добавляем новый IOCTL код, если его нет
+#define OP_HIJACK_THREAD_ARGS 0x805 // Новый код для вызова с аргументами
 
-// Глобальные переменные для адресов
-uintptr_t g_visible_shellcode = 0;
-uintptr_t g_visible_result = 0;
-uintptr_t g_lineofsight_addr = 0;
+// Обновленная структура для передачи регистров
+typedef struct _THREAD_HIJACK_ARGS {
+    int32_t pid;      // ID потока (TID)
+    uint64_t rip;     // Адрес шеллкода (PC)
+    uint64_t x0;      // Аргумент 1 (PlayerController)
+    uint64_t x1;      // Аргумент 2 (Enemy)
+    uint64_t x2;      // Аргумент 3 (Func Addr)
+    uint64_t x3;      // Аргумент 4 (Result Addr)
+} THREAD_HIJACK_ARGS;
 
 #endif
