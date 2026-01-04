@@ -73,10 +73,15 @@ jobs:
       run: |
         cd kernel-source/drivers/khack
         echo "Spoofing Vermagic..."
-        # Используем printf для безопасной вставки строки с пробелами
-        sed -i '1i #include <linux/vermagic.h>
-#undef MODULE_VERMAGIC
-#define MODULE_VERMAGIC "${{ matrix.magic_string }}"' entry.c
+        
+        # Создаем временный файл с макросом
+        echo '#include <linux/vermagic.h>' > temp_entry.c
+        echo '#undef MODULE_VERMAGIC' >> temp_entry.c
+        echo '#define MODULE_VERMAGIC "${{ matrix.magic_string }}"' >> temp_entry.c
+        
+        # Объединяем с оригиналом
+        cat entry.c >> temp_entry.c
+        mv temp_entry.c entry.c
 
     - name: Build Module
       env:
