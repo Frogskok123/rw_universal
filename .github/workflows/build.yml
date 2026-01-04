@@ -21,13 +21,13 @@ jobs:
             spoof_vermagic: "false"
             magic_string: ""
 
-          # --- GKI 6.1 (Android 14/15 Dirty) ---
+          # --- GKI 6.1 (Android 14/15) ---
           - kernel-version: 6.1-gki-dirty
             repo_url: https://android.googlesource.com/kernel/common
             branch: android14-6.1
             config: gki_defconfig
             spoof_vermagic: "true"
-            # Строка подмены (из uname -r)
+            # Строка подмены (из uname -r на твоем устройстве)
             magic_string: "6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions"
 
     steps:
@@ -58,7 +58,7 @@ jobs:
         mkdir -p drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        # Генерация Kconfig/Makefile
+        # Генерация Kconfig/Makefile для драйвера
         echo 'config KERNEL_HACK' > drivers/khack/Kconfig
         echo '    tristate "Memory Hack"' >> drivers/khack/Kconfig
         echo '    default m' >> drivers/khack/Kconfig
@@ -69,22 +69,7 @@ jobs:
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-    - name: Spoof Vermagic (Only if needed)
-      if: matrix.spoof_vermagic == 'true'
-      run: |
-        cd kernel-source/drivers/khack
-        echo "Spoofing Vermagic..."
-        
-        # Создаем временный файл с макросом
-        echo '#include <linux/vermagic.h>' > temp_entry.c
-        echo '#undef MODULE_VERMAGIC' >> temp_entry.c
-        echo '#define MODULE_VERMAGIC "${{ matrix.magic_string }}"' >> temp_entry.c
-        
-        # Объединяем с оригиналом
-        cat entry.c >> temp_entry.c
-        mv temp_entry.c entry.c
-
-    - name: Build Module (Fast Mode)
+    - name: Build Module (Fast Mode + Vermagic Override)
       env:
         ARCH: arm64
         LLVM: 1
@@ -96,29 +81,39 @@ jobs:
         # 1. Config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS ${{ matrix.config }}
         
-        # 2. OPTIMIZATION: Disable LTO (Ускоряет сборку в 3-5 раз!)
+        # 2. OPTIMIZATION: Отключаем LTO (Ускоряет сборку в разы)
         ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG
         ./scripts/config --file out/.config --disable CONFIG_LTO
         ./scripts/config --file out/.config --enable CONFIG_LTO_NONE
         
-        # 3. Disable Checks
+        # 3. Отключаем проверки версий и подписей
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG
         ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_FORCE
         
-        # 4. Enable Module
+        # 4. Включаем наш модуль в конфиг
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # 5. Build
+        # 5. Подготовка к сборке
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # Используем -Wno-error чтобы игнорировать баги хидеров ядра
+        # 6. ФОРМИРУЕМ ФЛАГИ (Ключевой момент фикса)
+        # Мы передаем VERMAGIC прямо в компилятор, минуя редактирование файлов
+        EXTRA_FLAGS="-Wno-array-bounds -Wno-error"
+        
+        if [ "${{ matrix.spoof_vermagic }}" = "true" ]; then
+             echo "Applying Vermagic spoof: ${{ matrix.magic_string }}"
+             # Экранирование кавычек для передачи строки с пробелами внутрь макроса C
+             EXTRA_FLAGS="$EXTRA_FLAGS -DMODULE_VERMAGIC="\\"${{ matrix.magic_string }}\\"""
+        fi
+        
+        # 7. Сборка самого модуля
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-             KCFLAGS="-Wno-array-bounds -Wno-error" \
+             KCFLAGS="$EXTRA_FLAGS" \
              -j$(nproc) M=drivers/khack
         
-        # Уменьшаем размер
+        # 8. Стриппинг (уменьшение размера)
         llvm-strip --strip-debug out/drivers/khack/*.ko
 
     - name: Upload Artifact
