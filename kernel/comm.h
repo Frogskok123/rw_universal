@@ -58,6 +58,21 @@ typedef struct _DEBUG_EVENT {
 } DEBUG_EVENT;
 // В enum OPERATIONS добавь:
 
+// Определяем структуру, идентичную той, что в драйвере
+struct THREAD_HIJACK_ARGS {
+    int32_t pid;
+    uint64_t rip;
+    uint64_t x0;
+    uint64_t x1;
+    uint64_t x2;
+    uint64_t x3;
+};
 
+#define OP_HIJACK_THREAD_ARGS 0x810 // Тот же код, что и в драйвере
+
+// Глобальные переменные для адресов
+uintptr_t g_visible_shellcode = 0;
+uintptr_t g_visible_result = 0;
+uintptr_t g_lineofsight_addr = 0;
 
 #endif
