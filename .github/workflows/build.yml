@@ -1,3 +1,4 @@
+
 name: Build GKI Kernel Modules (5.4, 5.10, 5.15, 6.1)
 
 on:
@@ -112,12 +113,4 @@ jobs:
       with:
         name: jiangnight-${{ matrix.kernel-version }}.ko
         path: gki-kernel/out/**/jiangnight.ko
-        if-no-files-found: error        # 4. Сборка модуля
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
-
-    - name: Upload module
-      uses: actions/upload-artifact@v4
-      with:
-        name: Oneplus-${{ matrix.kernel-version }}.ko
-        path: gki-kernel/out/**/hack.ko
         if-no-files-found: error
