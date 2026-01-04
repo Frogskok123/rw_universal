@@ -17,7 +17,7 @@ jobs:
           - kernel_version: "5.10-gki"
             branch: "android12-5.10"
             ndk_version: "r25c"
-            # Для 5.10 используем старый NDK и стандартные флаги
+            # Для 5.10 используем старый NDK
             setup_ndk_manually: true
 
           # --- Конфигурация для 6.1 (Android 14) ---
@@ -104,8 +104,6 @@ jobs:
             ./scripts/config --file out/.config --enable CONFIG_LTO_CLANG_THIN
             ./scripts/config --file out/.config --disable CONFIG_LTO_CLANG_FULL
             ./scripts/config --file out/.config --enable CONFIG_MODVERSIONS
-            # Для 6.1.158 часто нужно явно указать версию (опционально)
-            # EXTRA_CFLAGS="-DMODULE_VERMAGIC="6.1.158-g5e6db7045704-dirty SMP preempt mod_unload modversions""
         fi
         
         # 3. Добавляем модуль в конфиг
@@ -118,9 +116,18 @@ jobs:
         # 5. Сборка модуля
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
         
-        # 6. Стриппинг (уменьшение веса)
-        # Ищем файл, так как путь может отличаться
-        find out -name "jiangnight.ko" -exec llvm-strip --strip-debug {} ;
+        # 6. Стриппинг (ИСПРАВЛЕННЫЙ МЕТОД: Без find -exec)
+        # Находим файл и сохраняем путь
+        KO_FILE=$(find out -name "jiangnight.ko" -type f | head -n 1)
+        
+        if [ -f "$KO_FILE" ]; then
+            echo "Found module at: $KO_FILE"
+            echo "Stripping debug info..."
+            llvm-strip --strip-debug "$KO_FILE"
+        else
+            echo "ERROR: Module not found!"
+            exit 1
+        fi
 
     # --- ЗАГРУЗКА РЕЗУЛЬТАТА ---
 
