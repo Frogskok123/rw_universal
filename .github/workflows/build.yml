@@ -50,7 +50,6 @@ jobs:
     - name: Clone Kernel Source
       run: |
         git clone --depth 1 --branch ${{ matrix.branch }} ${{ matrix.repo_url }} kernel-source
-
     - name: Integrate Driver
       run: |
         cd kernel-source
