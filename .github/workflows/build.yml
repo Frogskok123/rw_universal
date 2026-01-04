@@ -16,8 +16,8 @@ jobs:
           # Android 10/11 (Legacy Stable) - Added 4.19
           - kernel-version: 4.19.312
             branch: android-4.19
-            config: gki_defconfig # Часто используется gki_defconfig, но если нужен perf, раскомментируй ниже
-            # config: perf_defconfig 
+           #  config: gki_defconfig # Часто используется gki_defconfig, но если нужен perf, раскомментируй ниже
+            config: perf_defconfig 
 
           # Android 11 (Legacy GKI)
           - kernel-version: 5.4
